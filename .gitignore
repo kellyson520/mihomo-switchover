@@ -1,0 +1,6 @@
+/dist/
+/tmp/
+/data/
+/logs/
+*.test
+*.out
