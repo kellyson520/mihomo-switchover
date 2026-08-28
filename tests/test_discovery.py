@@ -17,6 +17,8 @@ try:
         render_guardian_config,
         discover_quality_ports,
         prepare_quality_targets,
+        quality_targets_from_text,
+        read_proc_socket_ports,
     )
 except ModuleNotFoundError as exc:
     if exc.name not in {"scripts", "scripts.discover"}:
@@ -28,6 +30,8 @@ except ModuleNotFoundError as exc:
     render_guardian_config = None
     discover_quality_ports = None
     prepare_quality_targets = None
+    quality_targets_from_text = None
+    read_proc_socket_ports = None
     discover_module = None
     _DISCOVERY_MISSING = True
 else:
@@ -703,6 +707,21 @@ def test_quality_port_discovery_fails_closed_without_socket_tables_or_on_user_po
         )
 
 
+@pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
+def test_quality_targets_from_example_config_reads_targets_under_quality_root():
+    example = Path(__file__).parents[1] / "configs" / "guardian.example.yaml"
+
+    targets = quality_targets_from_text(example.read_text(encoding="utf-8"))
+
+    assert [target["id"] for target in targets] == ["primary", "reserve"]
+
+
+@pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
+def test_proc_socket_parser_rejects_unknown_nonempty_rows():
+    with pytest.raises(ValueError, match="socket table|unsupported"):
+        read_proc_socket_ports("sl\ngarbage\n", "sl\n")
+
+
 def test_install_contains_read_only_quality_preflight_and_quality_patch_path():
     script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
     assert "prepare_quality_targets" in script
@@ -710,3 +729,4 @@ def test_install_contains_read_only_quality_preflight_and_quality_patch_path():
     assert 'docker exec "$CONTAINER" cat /proc/net/tcp' in script
     assert 'docker exec "$CONTAINER" cat /proc/net/tcp6' in script
     assert "preflight=ok (no files, services, or containers changed)" in script
+    assert "patched = patch_quality_targets(patched, targets)" in script

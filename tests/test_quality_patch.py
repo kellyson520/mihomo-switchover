@@ -1,5 +1,6 @@
 import pytest
 
+from scripts.discover import _parse_yaml
 from scripts.mihomo_config_patch import patch_quality_targets
 
 
@@ -176,3 +177,28 @@ def test_quality_patch_preserves_crlf_and_allows_existing_owned_blocks():
     assert "\r\n" in source
     assert "\n" not in source.replace("\r\n", "")
     assert patch_quality_targets(source, TARGETS) == source
+
+
+def test_quality_patch_reuses_empty_listeners_section_without_duplicate_keys():
+    source = """proxy-groups:
+  - name: MAIN
+    type: select
+    proxies: [DIRECT]
+listeners: []
+"""
+    targets = [
+        {
+            "id": "primary",
+            "source_group": "MAIN",
+            "listener": "http://127.0.0.1:17990",
+        }
+    ]
+
+    once = patch_quality_targets(source, targets)
+
+    assert once.count("listeners:") == 1
+    parsed = _parse_yaml(once, "patched mihomo config")
+    assert [entry["name"] for entry in parsed["listeners"]] == [
+        "guardian-quality-primary"
+    ]
+    assert patch_quality_targets(once, targets) == once

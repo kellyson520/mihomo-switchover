@@ -236,12 +236,14 @@ PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_MAIN" "$DISCOVERED_
 import json
 import sys
 from pathlib import Path
+from scripts.discover import _parse_yaml
 from scripts.mihomo_config_patch import patch_provider_groups, patch_quality_targets
 
 text = Path(sys.argv[1]).read_text(encoding="utf-8")
 patched = patch_provider_groups(text, sys.argv[2], sys.argv[3])
 targets = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
-patch_quality_targets(patched, targets)
+patched = patch_quality_targets(patched, targets)
+_parse_yaml(patched, "patched mihomo config")
 PY
 
 if [ "$PRELIGHT" -eq 1 ]; then

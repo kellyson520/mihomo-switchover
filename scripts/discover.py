@@ -1119,8 +1119,19 @@ def read_proc_socket_ports(tcp_text: str, tcp6_text: str) -> set[int]:
     for table in (tcp_text, tcp6_text):
         for line in table.splitlines():
             fields = line.split()
-            if len(fields) < 2 or fields[0].lower() in {"sl", "local_address"}:
+            if not fields:
                 continue
+            first = fields[0].lower()
+            if first == "sl":
+                if len(fields) == 1 or fields[1].lower() == "local_address":
+                    continue
+                raise ValueError("tcp socket table has an unsupported header")
+            if first == "local_address":
+                if len(fields) == 1 or fields[1].lower() == "rem_address":
+                    continue
+                raise ValueError("tcp socket table has an unsupported header")
+            if len(fields) < 2:
+                raise ValueError("tcp socket table has an unsupported row")
             local_field = next(
                 (
                     field
@@ -1158,7 +1169,10 @@ def _quality_section_text(text: str, section: str) -> str | None:
     bounds = _section_bounds(lines, section)
     if bounds is None:
         return None
-    return "".join(lines[bounds[0] : bounds[1]])
+    # Return the section body, not its top-level key.  The caller for the
+    # guardian config expects a mapping/list directly; retaining ``quality:``
+    # would make enabled targets look like an empty disabled section.
+    return "".join(lines[bounds[0] + 1 : bounds[1]])
 
 
 def _configured_ports(config: Mapping[str, Any]) -> set[int]:

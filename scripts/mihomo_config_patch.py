@@ -286,6 +286,10 @@ def patch_quality_targets(
             current_removable_listeners,
         )
         listener_bounds = _section_bounds(new_lines, "listeners")
+        if listener_bounds is not None:
+            listener_bounds = _expand_empty_list_section(
+                new_lines, listener_bounds, "listeners", newline
+            )
     generated_listeners: list[str] = []
     for target in normalised:
         listener_name = _QUALITY_LISTENER_PREFIX + target["id"]
@@ -420,7 +424,7 @@ def _section_bounds(
         raw = line.rstrip("\r\n")
         if not raw or raw[0].isspace() or raw.lstrip().startswith("#"):
             continue
-        if re.match(rf"^{re.escape(section)}:\s*(?:#.*)?$", raw):
+        if re.match(rf"^{re.escape(section)}:\s*(?:\[\s*\])?\s*(?:#.*)?$", raw):
             if start is not None:
                 raise ValueError(f"duplicate top-level section {section!r}")
             start = index
@@ -432,6 +436,26 @@ def _section_bounds(
         if raw and not raw[0].isspace() and not raw.startswith("#") and ":" in raw:
             end = index
             break
+    return start, end
+
+
+def _expand_empty_list_section(
+    lines: list[str],
+    bounds: tuple[int, int],
+    section: str,
+    newline: str,
+) -> tuple[int, int]:
+    """Turn ``section: []`` into a block header before inserting list items."""
+
+    start, end = bounds
+    raw = lines[start].rstrip("\r\n")
+    match = re.fullmatch(
+        rf"({re.escape(section)}:)\s*\[\s*\](\s*#.*)?", raw
+    )
+    if match is None:
+        return bounds
+    comment = match.group(2) or ""
+    lines[start] = f"{match.group(1)}{comment}{newline}"
     return start, end
 
 
