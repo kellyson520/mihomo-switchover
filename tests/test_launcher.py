@@ -11,6 +11,31 @@ def test_launcher_restarts_guardian_without_killing_mihomo():
     assert '"$GUARDIAN_BIN" run' in script
 
 
+def test_launcher_supervises_quality_daemon_as_an_independent_child_loop():
+    script = (Path(__file__).parents[1] / "deploy" / "start-guardian.sh").read_text()
+    assert "quality_loop() {" in script
+    assert '"$GUARDIAN_BIN" quality-daemon' in script
+    assert 'quality_pid' in script
+    assert 'current_quality_pid' in script
+    quality_loop = script.split("quality_loop() {", 1)[1].split("}\n\n", 1)[0]
+    assert 'kill "$mihomo_pid"' not in quality_loop
+    assert 'wait "$current_quality_pid"' in quality_loop
+    assert '--config "$GUARDIAN_CONFIG"' in quality_loop
+    assert '--data "$GUARDIAN_DATA"' in quality_loop
+    assert '--logs "$GUARDIAN_LOGS"' in quality_loop
+    assert '--secret-file "$GUARDIAN_SECRET"' in quality_loop
+    shutdown = script.split("shutdown() {", 1)[1].split("}\n\n", 1)[0]
+    assert 'kill "$quality_pid"' in shutdown
+    assert 'wait "$quality_pid"' in shutdown
+
+
+def test_launcher_cleans_quality_loop_when_mihomo_exits():
+    script = (Path(__file__).parents[1] / "deploy" / "start-guardian.sh").read_text()
+    after_mihomo_wait = script.split('wait "$mihomo_pid"', 1)[1]
+    assert 'kill "$quality_pid"' in after_mihomo_wait
+    assert 'wait "$quality_pid"' in after_mihomo_wait
+
+
 def test_install_is_discovery_driven_and_preflight_is_read_only():
     script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
     assert "scripts/discover.py" in script

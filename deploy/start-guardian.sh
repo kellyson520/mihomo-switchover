@@ -44,12 +44,37 @@ guardian_loop() {
 guardian_loop &
 guardian_pid=$!
 
+quality_loop() {
+    current_quality_pid=
+    trap 'if [ -n "${current_quality_pid:-}" ]; then kill "$current_quality_pid" 2>/dev/null || true; fi; exit 0' TERM INT
+    while kill -0 "$mihomo_pid" 2>/dev/null; do
+        set +e
+        "$GUARDIAN_BIN" quality-daemon \
+            --config "$GUARDIAN_CONFIG" \
+            --data "$GUARDIAN_DATA" \
+            --logs "$GUARDIAN_LOGS" \
+            --secret-file "$GUARDIAN_SECRET" &
+        current_quality_pid=$!
+        wait "$current_quality_pid"
+        quality_status=$?
+        set -e
+        current_quality_pid=
+        log "quality daemon exited status=$quality_status; mihomo remains running, retrying in 1s"
+        sleep 1
+    done
+}
+
+quality_loop &
+quality_pid=$!
+
 shutdown() {
     trap - TERM INT
     log "shutdown requested; stopping launcher children"
     kill "$guardian_pid" 2>/dev/null || true
+    kill "$quality_pid" 2>/dev/null || true
     kill "$mihomo_pid" 2>/dev/null || true
     wait "$guardian_pid" 2>/dev/null || true
+    wait "$quality_pid" 2>/dev/null || true
     wait "$mihomo_pid" 2>/dev/null || true
     exit 0
 }
@@ -61,6 +86,8 @@ wait "$mihomo_pid"
 mihomo_status=$?
 set -e
 kill "$guardian_pid" 2>/dev/null || true
+kill "$quality_pid" 2>/dev/null || true
 wait "$guardian_pid" 2>/dev/null || true
+wait "$quality_pid" 2>/dev/null || true
 log "mihomo exited status=$mihomo_status; launcher exiting"
 exit "$mihomo_status"
