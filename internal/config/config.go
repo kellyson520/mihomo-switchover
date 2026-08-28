@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,7 @@ type Config struct {
 	Decision  DecisionConfig  `yaml:"decision"`
 	Probes    []ProbeSpec     `yaml:"probes"`
 	Purity    PurityConfig    `yaml:"purity"`
+	Quality   QualityConfig   `yaml:"quality"`
 	Logging   LoggingConfig   `yaml:"logging"`
 	Reload    ReloadConfig    `yaml:"reload"`
 }
@@ -72,6 +74,50 @@ type PurityConfig struct {
 	Timeout         time.Duration `yaml:"-"`
 }
 
+type QualityConfig struct {
+	Enabled          bool                   `yaml:"enabled"`
+	FullScanInterval time.Duration          `yaml:"-"`
+	RetryInterval    time.Duration          `yaml:"-"`
+	Order            []string               `yaml:"order"`
+	Targets          []QualityTarget        `yaml:"targets"`
+	PerNodeTimeout   time.Duration          `yaml:"-"`
+	Thresholds       QualityThresholds      `yaml:"thresholds"`
+	Stability        QualityStabilityConfig `yaml:"stability"`
+	Retention        QualityRetentionConfig `yaml:"retention"`
+}
+
+type QualityTarget struct {
+	ID          string `yaml:"id"`
+	SourceGroup string `yaml:"source_group"`
+	Provider    string `yaml:"provider"`
+	Scope       string `yaml:"scope"`
+	LockKey     string `yaml:"lock_key"`
+	NodeFilter  string `yaml:"node_filter"`
+	Listener    string `yaml:"listener"`
+}
+
+type QualityThresholds struct {
+	BaselineDropPoints    int `yaml:"baseline_drop_points"`
+	MinimumConfidence     int `yaml:"minimum_confidence"`
+	CandidateMinimumScore int `yaml:"candidate_minimum_score"`
+	RecoveryMarginPoints  int `yaml:"recovery_margin_points"`
+	RecoveryConfirmations int `yaml:"recovery_confirmations"`
+}
+
+type QualityStabilityConfig struct {
+	SummaryInterval time.Duration `yaml:"-"`
+	HistoryWindow   time.Duration `yaml:"-"`
+	MinimumSamples  int           `yaml:"minimum_samples"`
+	StaleAfter      time.Duration `yaml:"-"`
+	GoodLatencyMS   int           `yaml:"good_latency_ms"`
+	BadLatencyMS    int           `yaml:"bad_latency_ms"`
+}
+
+type QualityRetentionConfig struct {
+	Reports     int `yaml:"reports"`
+	HistoryDays int `yaml:"history_days"`
+}
+
 type LoggingConfig struct {
 	MaxBytes int `yaml:"max_bytes"`
 	Retain   int `yaml:"retain"`
@@ -88,6 +134,7 @@ type rawConfig struct {
 	Decision  rawDecision     `yaml:"decision"`
 	Probes    []rawProbe      `yaml:"probes"`
 	Purity    rawPurity       `yaml:"purity"`
+	Quality   *rawQuality     `yaml:"quality"`
 	Logging   LoggingConfig   `yaml:"logging"`
 	Reload    rawReload       `yaml:"reload"`
 }
@@ -120,6 +167,50 @@ type rawPurity struct {
 	AutomaticSwitch bool     `yaml:"automatic_switch"`
 	URLs            []string `yaml:"urls"`
 	Timeout         string   `yaml:"timeout"`
+}
+
+type rawQuality struct {
+	Enabled          *bool                `yaml:"enabled"`
+	FullScanInterval string               `yaml:"full_scan_interval"`
+	RetryInterval    string               `yaml:"retry_interval"`
+	Order            []string             `yaml:"order"`
+	Targets          []rawQualityTarget   `yaml:"targets"`
+	PerNodeTimeout   string               `yaml:"per_node_timeout"`
+	Thresholds       rawQualityThresholds `yaml:"thresholds"`
+	Stability        rawQualityStability  `yaml:"stability"`
+	Retention        rawQualityRetention  `yaml:"retention"`
+}
+
+type rawQualityTarget struct {
+	ID          string `yaml:"id"`
+	SourceGroup string `yaml:"source_group"`
+	Provider    string `yaml:"provider"`
+	Scope       string `yaml:"scope"`
+	LockKey     string `yaml:"lock_key"`
+	NodeFilter  string `yaml:"node_filter"`
+	Listener    string `yaml:"listener"`
+}
+
+type rawQualityThresholds struct {
+	BaselineDropPoints    *int `yaml:"baseline_drop_points"`
+	MinimumConfidence     *int `yaml:"minimum_confidence"`
+	CandidateMinimumScore *int `yaml:"candidate_minimum_score"`
+	RecoveryMarginPoints  *int `yaml:"recovery_margin_points"`
+	RecoveryConfirmations *int `yaml:"recovery_confirmations"`
+}
+
+type rawQualityStability struct {
+	SummaryInterval string `yaml:"summary_interval"`
+	HistoryWindow   string `yaml:"history_window"`
+	MinimumSamples  *int   `yaml:"minimum_samples"`
+	StaleAfter      string `yaml:"stale_after"`
+	GoodLatencyMS   *int   `yaml:"good_latency_ms"`
+	BadLatencyMS    *int   `yaml:"bad_latency_ms"`
+}
+
+type rawQualityRetention struct {
+	Reports     *int `yaml:"reports"`
+	HistoryDays *int `yaml:"history_days"`
 }
 
 type rawReload struct {
@@ -219,6 +310,10 @@ func normalize(raw rawConfig) (Config, error) {
 	if err != nil {
 		return Config{}, fieldError("purity.timeout", err)
 	}
+	cfg.Quality, err = normalizeQuality(raw.Quality)
+	if err != nil {
+		return Config{}, err
+	}
 	cfg.Reload.CheckInterval, err = durationOrDefault(raw.Reload.CheckInterval, 2*time.Second)
 	if err != nil {
 		return Config{}, fieldError("reload.check_interval", err)
@@ -234,6 +329,76 @@ func normalize(raw rawConfig) (Config, error) {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func normalizeQuality(raw *rawQuality) (QualityConfig, error) {
+	if raw == nil {
+		raw = &rawQuality{}
+	}
+
+	quality := QualityConfig{}
+	if raw.Enabled != nil {
+		quality.Enabled = *raw.Enabled
+	}
+	var err error
+	quality.FullScanInterval, err = durationOrDefault(raw.FullScanInterval, 720*time.Hour)
+	if err != nil {
+		return QualityConfig{}, fieldError("quality.full_scan_interval", err)
+	}
+	quality.RetryInterval, err = durationOrDefault(raw.RetryInterval, 24*time.Hour)
+	if err != nil {
+		return QualityConfig{}, fieldError("quality.retry_interval", err)
+	}
+	quality.PerNodeTimeout, err = durationOrDefault(raw.PerNodeTimeout, 180*time.Second)
+	if err != nil {
+		return QualityConfig{}, fieldError("quality.per_node_timeout", err)
+	}
+	quality.Order = append([]string(nil), raw.Order...)
+	for _, target := range raw.Targets {
+		quality.Targets = append(quality.Targets, QualityTarget{
+			ID:          target.ID,
+			SourceGroup: target.SourceGroup,
+			Provider:    target.Provider,
+			Scope:       target.Scope,
+			LockKey:     target.LockKey,
+			NodeFilter:  target.NodeFilter,
+			Listener:    target.Listener,
+		})
+	}
+
+	quality.Thresholds = QualityThresholds{
+		BaselineDropPoints:    intOrDefault(raw.Thresholds.BaselineDropPoints, 20),
+		MinimumConfidence:     intOrDefault(raw.Thresholds.MinimumConfidence, 70),
+		CandidateMinimumScore: intOrDefault(raw.Thresholds.CandidateMinimumScore, 60),
+		RecoveryMarginPoints:  intOrDefault(raw.Thresholds.RecoveryMarginPoints, 10),
+		RecoveryConfirmations: intOrDefault(raw.Thresholds.RecoveryConfirmations, 2),
+	}
+	quality.Stability.SummaryInterval, err = durationOrDefault(raw.Stability.SummaryInterval, time.Hour)
+	if err != nil {
+		return QualityConfig{}, fieldError("quality.stability.summary_interval", err)
+	}
+	quality.Stability.HistoryWindow, err = durationOrDefault(raw.Stability.HistoryWindow, 24*time.Hour)
+	if err != nil {
+		return QualityConfig{}, fieldError("quality.stability.history_window", err)
+	}
+	quality.Stability.StaleAfter, err = durationOrDefault(raw.Stability.StaleAfter, 26*time.Hour)
+	if err != nil {
+		return QualityConfig{}, fieldError("quality.stability.stale_after", err)
+	}
+	quality.Stability.MinimumSamples = intOrDefault(raw.Stability.MinimumSamples, 3)
+	quality.Stability.GoodLatencyMS = intOrDefault(raw.Stability.GoodLatencyMS, 500)
+	quality.Stability.BadLatencyMS = intOrDefault(raw.Stability.BadLatencyMS, 3000)
+	quality.Retention.Reports = intOrDefault(raw.Retention.Reports, 90)
+	quality.Retention.HistoryDays = intOrDefault(raw.Retention.HistoryDays, 180)
+
+	return quality, nil
+}
+
+func intOrDefault(value *int, fallback int) int {
+	if value == nil {
+		return fallback
+	}
+	return *value
 }
 
 func durationOrDefault(value string, fallback time.Duration) (time.Duration, error) {
@@ -277,6 +442,9 @@ func validate(cfg Config) error {
 	if cfg.Logging.MaxBytes < 1024 || cfg.Logging.Retain < 1 {
 		return errors.New("logging limits are too small")
 	}
+	if err := validateQuality(cfg.Quality); err != nil {
+		return err
+	}
 
 	ids := make(map[string]struct{})
 	critical := 0
@@ -312,6 +480,112 @@ func validate(cfg Config) error {
 		}
 	}
 	return nil
+}
+
+var qualityTargetIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
+
+func validateQuality(quality QualityConfig) error {
+	if quality.Enabled && len(quality.Targets) == 0 {
+		return errors.New("quality.enabled requires at least one target")
+	}
+
+	targets := make(map[string]QualityTarget, len(quality.Targets))
+	listeners := make(map[int]string, len(quality.Targets))
+	for _, target := range quality.Targets {
+		if !qualityTargetIDPattern.MatchString(target.ID) {
+			return fmt.Errorf("invalid quality target id %q", target.ID)
+		}
+		if _, exists := targets[target.ID]; exists {
+			return fmt.Errorf("duplicate quality target id %q", target.ID)
+		}
+		if strings.TrimSpace(target.SourceGroup) == "" {
+			return fmt.Errorf("quality target %q requires source_group", target.ID)
+		}
+		if target.Scope != "locked" && target.Scope != "all" {
+			return fmt.Errorf("quality target %q scope must be locked or all", target.ID)
+		}
+		if target.Scope == "locked" && strings.TrimSpace(target.LockKey) == "" {
+			return fmt.Errorf("quality target %q requires lock_key for locked scope", target.ID)
+		}
+		port, err := validateQualityListener(target.Listener)
+		if err != nil {
+			return fmt.Errorf("quality target %q listener: %w", target.ID, err)
+		}
+		if previous, exists := listeners[port]; exists {
+			return fmt.Errorf("duplicate quality listener port %d for targets %q and %q", port, previous, target.ID)
+		}
+		listeners[port] = target.ID
+		if target.NodeFilter != "" {
+			if _, err := regexp.Compile(target.NodeFilter); err != nil {
+				return fmt.Errorf("quality target %q node_filter: %w", target.ID, err)
+			}
+		}
+		targets[target.ID] = target
+	}
+
+	seen := make(map[string]struct{}, len(quality.Order))
+	for _, id := range quality.Order {
+		if _, exists := targets[id]; !exists {
+			return fmt.Errorf("quality.order references unknown target %q", id)
+		}
+		if _, exists := seen[id]; exists {
+			return fmt.Errorf("quality.order contains duplicate target %q", id)
+		}
+		seen[id] = struct{}{}
+	}
+	if len(quality.Order) != len(quality.Targets) {
+		return errors.New("each quality target must appear exactly once in quality.order")
+	}
+	for id := range targets {
+		if _, exists := seen[id]; !exists {
+			return fmt.Errorf("quality target %q must appear exactly once in quality.order", id)
+		}
+	}
+
+	thresholds := quality.Thresholds
+	if thresholds.BaselineDropPoints < 1 || thresholds.BaselineDropPoints > 100 {
+		return errors.New("quality.thresholds.baseline_drop_points must be between 1 and 100")
+	}
+	if thresholds.MinimumConfidence < 0 || thresholds.MinimumConfidence > 100 {
+		return errors.New("quality.thresholds.minimum_confidence must be between 0 and 100")
+	}
+	if thresholds.CandidateMinimumScore < 0 || thresholds.CandidateMinimumScore > 100 {
+		return errors.New("quality.thresholds.candidate_minimum_score must be between 0 and 100")
+	}
+	if thresholds.RecoveryMarginPoints < 0 || thresholds.RecoveryMarginPoints > 100 {
+		return errors.New("quality.thresholds.recovery_margin_points must be between 0 and 100")
+	}
+	if thresholds.RecoveryConfirmations < 1 {
+		return errors.New("quality.thresholds.recovery_confirmations must be positive")
+	}
+
+	stability := quality.Stability
+	if stability.MinimumSamples < 1 {
+		return errors.New("quality.stability.minimum_samples must be positive")
+	}
+	if stability.GoodLatencyMS < 1 || stability.BadLatencyMS < 1 || stability.BadLatencyMS <= stability.GoodLatencyMS {
+		return errors.New("quality.stability latency thresholds must be positive and bad_latency_ms greater than good_latency_ms")
+	}
+	if quality.Retention.Reports < 1 || quality.Retention.HistoryDays < 1 {
+		return errors.New("quality retention reports and history_days must be positive")
+	}
+	return nil
+}
+
+func validateQualityListener(raw string) (int, error) {
+	listener, err := url.Parse(raw)
+	if err != nil || listener.Scheme != "http" || listener.Hostname() == "" || listener.User != nil || (listener.Path != "" && listener.Path != "/") || listener.RawQuery != "" || listener.Fragment != "" {
+		return 0, errors.New("must be an http loopback URL")
+	}
+	if !isLoopbackHost(listener.Hostname()) {
+		return 0, errors.New("must point to loopback")
+	}
+	portText := listener.Port()
+	port, err := strconv.Atoi(portText)
+	if portText == "" || err != nil || port < 1 || port > 65535 {
+		return 0, errors.New("must include a valid port")
+	}
+	return port, nil
 }
 
 func validateProxyURL(raw string) error {

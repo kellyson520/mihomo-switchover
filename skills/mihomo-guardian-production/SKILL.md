@@ -73,8 +73,55 @@ docker exec mihomo-cliproxy /guardian/bin/guardian probe \
 sudo ./scripts/status.sh --read-only
 ```
 
+### Quality 目标配置
+
+`quality` 是同一份 `guardian.yaml` 中的可选配置。旧部署可省略它，或保持
+`enabled: false`；不要为了启用质量扫描去修改号池配置。目标名称、来源组、provider、
+过滤器和扫描顺序完全由用户填写，不存在必须叫 `MAIN`、`BACKUP-USA` 或某个地区名称的
+约定。例如：
+
+```yaml
+quality:
+  enabled: true
+  full_scan_interval: 720h
+  retry_interval: 24h
+  order: [primary, reserve]
+  targets:
+    - id: primary
+      source_group: YOUR_PRIMARY_GROUP
+      provider: YOUR_PRIMARY_PROVIDER
+      scope: locked
+      lock_key: main
+      listener: http://127.0.0.1:17990
+    - id: reserve
+      source_group: YOUR_RESERVE_GROUP
+      provider: YOUR_RESERVE_PROVIDER
+      scope: all
+      node_filter: "YOUR_REGION_REGEX"
+      listener: http://127.0.0.1:17991
+```
+
+修改时遵守以下契约：
+
+- `order` 中的每个 target ID 必须在 `targets` 中恰好出现一次；不能重复、缺漏或引用不存在的 ID。
+- ID 只能使用 `[a-z0-9][a-z0-9_-]{0,31}`；`source_group`、`listener` 必填。
+- `scope: locked` 必须有 `lock_key`，只检查对应持久化锁定节点；`scope: all` 扫描来源组全部节点，再按可选 `node_filter` 筛选。
+- listener 必须是唯一端口的 loopback HTTP 地址，并带显式端口；不要占用生产代理端口，也不要把质量 listener 指向公网地址。
+- `node_filter` 必须是可编译正则。阈值、周期、保留期使用单文件中的默认值或按文档修改；配置加载会拒绝无效值。
+
+保存后按既定流程执行 `guardian reload`，然后查看 `config_reloaded` 或
+`config_reload_failed`。质量配置解析失败时继续使用上一份有效配置，不会停止 mihomo；
+listener、隔离质量组等基础设施字段由安装器管理，不能仅靠手工改 URL 让它们生效。
+
+质量扫描按 `quality.order` 固定顺序运行；mihomo 原生健康检测继续提供 provider
+health，guardian 每小时汇总已有延迟 history。首次完整有效报告建立不可变的
+`baseline_score`；后续分数上涨只更新 latest/best/历史，不自动改 baseline 或替换当前
+固定节点。身份包含 target、provider、节点名和 IP，换 IP 会产生新身份和新 baseline，
+旧身份历史保留。默认只有相对初始 baseline 下降至少 20 分才解除粘性，并且仍需通过
+连通性、provider history、IP 一致性和置信度复核。
+
 可热重载：`decision.mode`、决策阈值/周期/保持时间、`probes`、`purity`、
-`reload.check_interval`。需要重启 guardian：`mihomo` 连接端点、secret 路径、组、
+`quality`（目标顺序、阈值、周期、保留期）、`reload.check_interval`。需要重启 guardian：`mihomo` 连接端点、secret 路径、组、
 provider、日志配置、`link_loss_grace`、`startup_api_timeout`。静态字段变更后不能
 假定已生效；只重启 guardian 子进程，禁止重启 mihomo。
 

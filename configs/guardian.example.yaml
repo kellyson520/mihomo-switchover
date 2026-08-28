@@ -14,6 +14,44 @@ providers:
   main: main-channel
   backup: backup-channel
 
+# 质量扫描目标完全由用户定义；安装器只负责为每个目标准备隔离 listener/质量组。
+# source_group、provider 和 node_filter 必须替换为实际 mihomo 名称/正则；以下只是示例。
+quality:
+  enabled: true
+  full_scan_interval: 720h
+  retry_interval: 24h
+  order: [primary, reserve]
+  targets:
+    - id: primary
+      source_group: YOUR_PRIMARY_GROUP
+      provider: YOUR_PRIMARY_PROVIDER
+      scope: locked
+      lock_key: main
+      listener: http://127.0.0.1:17990
+    - id: reserve
+      source_group: YOUR_RESERVE_GROUP
+      provider: YOUR_RESERVE_PROVIDER
+      scope: all
+      node_filter: "YOUR_REGION_REGEX"
+      listener: http://127.0.0.1:17991
+  per_node_timeout: 180s
+  thresholds:
+    baseline_drop_points: 20
+    minimum_confidence: 70
+    candidate_minimum_score: 60
+    recovery_margin_points: 10
+    recovery_confirmations: 2
+  stability:
+    summary_interval: 1h
+    history_window: 24h
+    minimum_samples: 3
+    stale_after: 26h
+    good_latency_ms: 500
+    bad_latency_ms: 3000
+  retention:
+    reports: 90
+    history_days: 180
+
 decision:
   mode: auto
   interval: 15s

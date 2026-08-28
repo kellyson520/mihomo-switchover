@@ -18,7 +18,7 @@
 
 只编辑这一份 `guardian.yaml`。安装器会从 mihomo 配置发现容器内 API、代理端口、
 主备组和 provider，并只重写配置中的基础设施段；`decision`、`probes`、`purity`、
-`logging` 和 `reload` 等行为段由模板/现有配置保留。
+`quality`、`logging` 和 `reload` 等行为段由模板/现有配置保留。
 
 不要在文件中写入控制器 secret、厂商 API key、订阅 token 或账号信息。控制器 secret
 应保存在挂载区的：
@@ -46,6 +46,43 @@ groups:
 providers:
   main: main-channel
   backup: backup-channel
+
+# 目标 ID、顺序、来源组和过滤器均由用户定义；下面的名称只是示例。
+quality:
+  enabled: true
+  full_scan_interval: 720h
+  retry_interval: 24h
+  order: [primary, reserve]
+  targets:
+    - id: primary
+      source_group: YOUR_PRIMARY_GROUP
+      provider: YOUR_PRIMARY_PROVIDER
+      scope: locked
+      lock_key: main
+      listener: http://127.0.0.1:17990
+    - id: reserve
+      source_group: YOUR_RESERVE_GROUP
+      provider: YOUR_RESERVE_PROVIDER
+      scope: all
+      node_filter: "YOUR_REGION_REGEX"
+      listener: http://127.0.0.1:17991
+  per_node_timeout: 180s
+  thresholds:
+    baseline_drop_points: 20
+    minimum_confidence: 70
+    candidate_minimum_score: 60
+    recovery_margin_points: 10
+    recovery_confirmations: 2
+  stability:
+    summary_interval: 1h
+    history_window: 24h
+    minimum_samples: 3
+    stale_after: 26h
+    good_latency_ms: 500
+    bad_latency_ms: 3000
+  retention:
+    reports: 90
+    history_days: 180
 
 decision:
   mode: observe
@@ -140,6 +177,58 @@ GET /providers/proxies/<provider>
 和号池风控风险。若没有 provider 配置，guardian 才使用 mihomo 的节点 delay API
 验证候选；该检查不会把候选临时切入生产流量。
 
+### `quality`
+
+这是可选的质量扫描契约。旧部署可以省略整个 `quality` 段，或明确设置
+`enabled: false`；启用时至少需要一个 target。target 的 ID、来源分组、provider、
+扫描顺序和过滤器都由用户配置，没有固定的 `MAIN`、`BACKUP-USA`、地区名称或 target
+名称要求。
+
+`order` 是严格的扫描顺序；其中每个 ID 必须在 `targets` 中恰好出现一次，不能重复或
+缺漏。target ID 必须匹配 `[a-z0-9][a-z0-9_-]{0,31}`。每个 target 的
+`source_group` 和 `listener` 必填，`listener` 必须是带明确端口的 loopback HTTP URL，
+且端口不能重复。`node_filter` 是用户自定义正则，guardian 会在加载配置时编译它，
+无法编译的配置会被拒绝。
+
+| 字段 | 说明 |
+| --- | --- |
+| `source_group` | mihomo 中待扫描的来源 proxy group，名称必须与控制 API 返回值一致。 |
+| `provider` | 可选的 mihomo provider 名称；留空时由运行时按来源组解析静态节点。 |
+| `scope: locked` | 只扫描持久化状态中 `lock_key` 对应的当前锁定节点；必须填写 `lock_key`。 |
+| `scope: all` | 扫描来源组中的全部节点，并可用 `node_filter` 进一步筛选。 |
+| `listener` | 质量扫描专用的 loopback listener；不能指向生产代理端口。 |
+
+默认时间和阈值如下：
+
+| 配置 | 默认值 | 作用 |
+| --- | ---: | --- |
+| `full_scan_interval` | `720h` | 全量质量扫描周期。 |
+| `retry_interval` | `24h` | 失败目标重试间隔。 |
+| `per_node_timeout` | `180s` | 单节点质量探测超时。 |
+| `stability.summary_interval` | `1h` | 每小时汇总 mihomo history。 |
+| `stability.history_window` / `stale_after` | `24h` / `26h` | 稳定性统计窗口和过期界线。 |
+| `stability.minimum_samples` | `3` | 稳定性结论所需的最小样本数。 |
+| `stability.good_latency_ms` / `bad_latency_ms` | `500` / `3000` | 延迟评分区间，后者必须大于前者。 |
+| `thresholds.baseline_drop_points` | `20` | 相对初始 baseline 的释放阈值，单位为分。 |
+| `thresholds.minimum_confidence` / `candidate_minimum_score` | `70` / `60` | 推荐所需的最低置信度和候选分数。 |
+| `thresholds.recovery_margin_points` / `recovery_confirmations` | `10` / `2` | 恢复候选的安全余量和确认次数。 |
+| `retention.reports` / `history_days` | `90` / `180` | 报告数量和 history 保留天数。 |
+
+质量分使用 IP/厂商/风险证据，稳定性分使用 mihomo provider 的延迟 history；最终分按
+质量 70%、稳定性 30% 合成。mihomo 自己的 provider 健康检测继续按其原生周期运行，
+guardian 每小时读取并汇总已有 history，不为汇总额外制造公网探测。history 过期、样本
+不足或关键证据缺失时保持未验证并降低置信度，不把未知误判为失败或干净。
+
+第一次完整且有效的报告为该身份建立 `baseline_score`，baseline 不会因后续分数上涨而
+改变。上涨只更新 `latest_score`、`best_score` 和历史记录；当前固定节点也不会因为另
+一个节点分数更高而自动替换。身份是 `target + provider + node + IP`，IP 变化会创建
+新的身份和新的 baseline，旧 IP 的历史保留，IP 恢复时可继续使用旧记录。
+
+默认只有当前分数相对其初始 baseline 下降 20 分或更多（`baseline_drop_points: 20`）
+才解除节点粘性；19 分下降不触发。解除前仍须有新鲜厂商连通性、provider 健康 history、
+IP 身份一致和最低置信度。阈值、保留期和 target 顺序可热重载；listener、隔离质量组
+等 mihomo 基础设施由安装器管理。
+
 ### `decision`
 
 | 字段 | 默认值 | 说明 |
@@ -218,6 +307,7 @@ provider 健康历史和厂商探测结果，再按运维命令执行有审计�
 - `decision.critical_quorum`
 - `probes` 的内容和探测参数
 - `purity` 的内容
+- `quality` 的 target 顺序、扫描周期、阈值、稳定性窗口和保留期
 - `reload.check_interval`
 
 ### 需要重启 guardian 的字段
@@ -229,6 +319,7 @@ provider 健康历史和厂商探测结果，再按运维命令执行有审计�
 - `mihomo.secret_file`
 - `groups`
 - `providers`
+- `quality` target 的 `listener` 及安装器生成的隔离质量组
 - `logging`
 - `decision.link_loss_grace`
 - `decision.startup_api_timeout`
