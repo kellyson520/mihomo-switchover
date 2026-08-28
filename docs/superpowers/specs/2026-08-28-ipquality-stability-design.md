@@ -6,9 +6,10 @@
 
 ## 1. 目标与边界
 
-本设计为现有 mihomo guardian 增加独立的质量评估旁路。它的目标是对主渠道锁定节点
-和备用供应商中的全部美国节点建立可追溯的 IP 质量、厂商可达性和 mihomo 延迟稳定性
-基线，并让实时 guardian 在有充分证据时筛选合适节点。
+本设计为现有 mihomo guardian 增加独立的质量评估旁路。它的目标是对用户配置的锁定
+目标和任意目标分组中的节点建立可追溯的 IP 质量、厂商可达性和 mihomo 延迟
+稳定性基线，并让实时 guardian 在有充分证据时筛选合适节点。目标分组、provider、
+节点范围和顺序都来自 `guardian.yaml`，不把 `MAIN`、`BACKUP-USA` 或“美国”写死。
 
 质量评估不是号池，也不读取或修改账号、额度、登录态或业务数据。质量进程不直接写入
 生产 `CHANNEL`、`MAIN` 或 `BACKUP-USA`。它只使用专用 mihomo 质量组、生成报告和
@@ -17,7 +18,7 @@
 必须满足以下安全约束：
 
 - 所有公网请求都经 mihomo 专用 loopback listener，不允许质量脚本直连公网；
-- 质量扫描顺序固定为主渠道锁定节点，再扫描备用 provider 的全部美国节点；
+- 质量扫描顺序固定为用户在配置中声明的目标顺序；
 - 扫描一个节点失败、超时、脚本崩溃或质量服务不可用时，继续保存证据并进入下一个
   节点，不停止 mihomo、实时 guardian 或号池；
 - 评分上涨只更新最新值和历史，不自动抬高初始基准；
@@ -34,8 +35,8 @@
 3. launcher 分别监督两个 guardian 子进程。任一 guardian 崩溃时只重启对应 guardian，
    不给 mihomo PID 发信号；
 4. 两个进程通过原子状态、质量报告和推荐文件协作，不共享易损的内存状态；
-5. 只有实时 guardian 能写入 `MAIN`、`BACKUP-USA` 和 `CHANNEL`。质量 daemon 只能写
-   `GUARDIAN-QUALITY-MAIN`、`GUARDIAN-QUALITY-BACKUP` 和 `/guardian/data/ipquality/`。
+5. 只有实时 guardian 能写入生产组和 `CHANNEL`。质量 daemon 只能写自动生成的
+   `GUARDIAN-QUALITY-*` 隔离组和 `/guardian/data/ipquality/`。
 
 不在生产循环中原样执行最新版 `xykt/IPQuality` 的 shell 脚本。该脚本依赖 Bash、curl、
 jq、bc、dig、nc，部分路径可能绕过代理，并包含报告/统计外联。实现借鉴其多源聚合的
@@ -45,40 +46,42 @@ jq、bc、dig、nc，部分路径可能绕过代理，并包含报告/统计外�
 
 ## 3. mihomo 隔离入口
 
-安装器在 mihomo 配置中增加两个不被生产组引用的 select 组和两个 loopback listener：
+安装器为每个用户配置的质量目标增加一个不被生产组引用的 select 组和一个 loopback
+listener。下面仅展示两个目标的示例，实际目标数量和名称由配置决定：
 
 ```yaml
 proxy-groups:
-  - name: GUARDIAN-QUALITY-MAIN
+  - name: GUARDIAN-QUALITY-primary
     type: select
     use:
-      - main-channel
-  - name: GUARDIAN-QUALITY-BACKUP
+      - provider-a
+  - name: GUARDIAN-QUALITY-reserve-us
     type: select
     use:
-      - backup-channel
+      - provider-b
 
 listeners:
-  - name: guardian-quality-main
+  - name: guardian-quality-primary
     type: mixed
     listen: 127.0.0.1
     port: 17990
-    proxy: GUARDIAN-QUALITY-MAIN
-  - name: guardian-quality-backup
+    proxy: GUARDIAN-QUALITY-primary
+  - name: guardian-quality-reserve-us
     type: mixed
     listen: 127.0.0.1
     port: 17991
-    proxy: GUARDIAN-QUALITY-BACKUP
+    proxy: GUARDIAN-QUALITY-reserve-us
 ```
 
 端口不发布到宿主机，也不监听 `0.0.0.0`。上面的 `17990` 和 `17991` 只是端口选择示例；
 安装器检查当前配置、mihomo API 和容器内监听表后，选择两个稳定的空闲端口并写入唯一
 行为配置。端口、组名或 listener 能力无法唯一确认时预检失败，不修改 mihomo。
 
-质量 daemon 每次扫描前从 guardian 状态读取对应 provider 锁定节点，并只通过质量组
-选择该节点。没有锁定记录、provider 元数据没有 `alive: true` 和非空健康历史、节点
-已经从 provider 消失，或质量 listener 不可用时，该节点标记为 `unverified`，不发起
-生产切换。
+质量 daemon 每次扫描前从 guardian 状态读取目标的锁定节点，并只通过对应质量组选择
+该节点。`source_group` 是用户要评估的现有 mihomo 分组，但质量 daemon 永远不向
+`source_group` 写选择；它只写自动生成的隔离质量组。没有锁定记录、provider 元数据
+没有 `alive: true` 和非空健康历史、节点已经从 provider 消失，或质量 listener 不可用
+时，该节点标记为 `unverified`，不发起生产切换。
 
 扫描质量组的选择不会改变 `MAIN`、`BACKUP-USA` 或 `CHANNEL`。安装器必须备份 mihomo
 配置；若运行中的 Alpha 版本不支持独立 listener，则质量功能保持关闭，实时 guardian
@@ -86,25 +89,27 @@ listeners:
 
 ## 4. 扫描范围和调度
 
-### 4.1 固定顺序
+### 4.1 用户定义的固定顺序
 
-每轮任务固定执行：
+每轮任务按照 `quality.targets` 的 `order` 字段执行，例如：
 
 ```text
-main provider 的当前锁定节点
+primary 目标的当前锁定节点
         ↓
-backup provider 的 provider 原始顺序第 1 个美国节点
+reserve-us 目标的 provider 原始顺序第 1 个节点
         ↓
-backup provider 的 provider 原始顺序第 2 个美国节点
+reserve-us 目标的 provider 原始顺序第 2 个节点
         ↓
 ...
 ```
 
-主渠道只检测当前锁定节点；备用渠道检测 provider 返回的全部符合美国筛选条件的节点。
+每个目标可以选择 `locked` 或 `all` 扫描范围。`locked` 只检测该目标的持久化锁定节点；
+`all` 检测该目标 provider 或静态分组中的全部节点，并可由该目标自己的 `node_filter`
+正则进一步筛选。分组和 provider 映射由安装器自动发现，也可以在配置中明确指定。
 不按延迟随机排序、不并发扫描、不因为某个节点较快就改变 provider 原始顺序。
 
-如果主节点检测失败，仍继续备用全量扫描；如果某个备用节点失败，记录单节点失败后
-继续下一个节点。单节点超时不阻塞整轮，整轮可在容器重启后依据游标继续。
+如果前一个目标检测失败，仍继续后续目标；如果某个节点失败，记录单节点失败后继续
+下一个节点。单节点超时不阻塞整轮，整轮可在容器重启后依据游标继续。
 
 ### 4.2 月度全量质量任务
 
@@ -112,10 +117,10 @@ backup provider 的 provider 原始顺序第 2 个美国节点
 启动时间为基准。扫描状态包含 provider 内容指纹、节点游标、最近尝试时间和最近成功
 时间：
 
-- provider 节点列表变化时，新节点立即进入本轮未扫描队列；
+- 任一目标的 provider 或静态分组节点列表变化时，新节点立即进入本轮未扫描队列；
 - 已消失节点保留历史，但标记 `provider_removed`；
 - 失败节点不会被伪造为成功，默认 24 小时后重试；
-- 主渠道失败不阻止备用渠道进入本轮；
+- 前一个目标失败不阻止后续目标进入本轮；
 - 扫描结果达到完整性要求后才更新该节点的月度成功时间。
 
 ### 4.3 每小时稳定性汇总
@@ -287,20 +292,29 @@ effective_score <= baseline_score - 20
 ## 9. 单一配置文件
 
 在现有 `guardian.yaml` 中增加 `quality` 段，安装器只自动生成基础设施字段，运行策略
-仍由同一文件控制：
+仍由同一文件控制。目标 ID、来源分组、provider、扫描范围和顺序均由用户修改：
 
 ```yaml
 quality:
   enabled: true
   full_scan_interval: 720h
   retry_interval: 24h
-  order: [main, backup]
-  backup_full_scan: true
-  main_scope: locked
+  order: [primary, reserve-us]
+  targets:
+    - id: primary
+      source_group: MAIN
+      provider: provider-a
+      scope: locked
+      lock_key: main
+      listener: http://127.0.0.1:17990
+    - id: reserve-us
+      source_group: BACKUP-USA
+      provider: provider-b
+      scope: all
+      node_filter: "美国"
+      lock_key: backup
+      listener: http://127.0.0.1:17991
   per_node_timeout: 180s
-  listener:
-    main: http://127.0.0.1:17990
-    backup: http://127.0.0.1:17991
   thresholds:
     baseline_drop_points: 20
     minimum_confidence: 70
@@ -319,10 +333,12 @@ quality:
     history_days: 180
 ```
 
-`order`、listener 地址和 provider 映射由安装器校验；质量策略、阈值、数据源和保留期
-可热重载。配置中的端口只是生成后的示例值，实际值由安装器写入并保持不变。mihomo
-配置、listener 端口、质量组和 provider 映射属于安装/重启 guardian 范围，不能只依赖
-运行时热重载。
+`order` 中的每个 ID 必须在 `targets` 中唯一存在，且每个目标的 `source_group` 必须在
+mihomo 中存在。`scope: locked` 必须有有效 `lock_key`；`scope: all` 扫描该目标的
+全部节点。`provider` 和 `node_filter` 可选，但目标无法唯一发现节点来源时预检失败。
+`listener` 地址由安装器自动选择并保持稳定，用户不应手工把它指向生产代理端口。
+质量策略、阈值、数据源和保留期可热重载。mihomo 配置、listener 端口、隔离质量组和
+provider 映射属于安装/重启 guardian 范围，不能只依赖运行时热重载。
 
 ## 10. 故障处理
 
@@ -342,7 +358,7 @@ quality:
 
 实现必须在不触碰生产 `CHANNEL` 的测试中证明：
 
-1. 备用 provider 的全部节点按固定顺序扫描，单节点失败不阻止后续节点；
+1. 每个 `scope: all` 目标的全部节点按用户配置顺序扫描，单节点失败不阻止后续节点；
 2. 质量组切换节点时生产组和 `CHANNEL` 选择保持不变；
 3. 所有外部请求都到达对应 loopback listener，不能直连；
 4. mihomo 原生历史能被按小时汇总，样本不足时为 unknown；
