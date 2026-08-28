@@ -25,7 +25,11 @@ from urllib.parse import urlsplit
 __all__ = [
     "Discovery",
     "discover_from_texts",
+    "discover_quality_ports",
     "load_discovery",
+    "prepare_quality_targets",
+    "quality_targets_from_text",
+    "read_proc_socket_ports",
     "render_guardian_config",
 ]
 
@@ -890,6 +894,370 @@ def _controller_port(value: Any) -> int:
     if not 1 <= port <= 65535:
         raise ValueError("external-controller port must be between 1 and 65535")
     return port
+
+
+_QUALITY_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
+_QUALITY_OWNER_RE = re.compile(
+    r"^#\s*mihomo-guardian:\s*generated quality target\s+"
+    r"([a-z0-9][a-z0-9_-]{0,31})\s*$"
+)
+_QUALITY_GROUP_PREFIX = "GUARDIAN-QUALITY-"
+_QUALITY_LISTENER_PREFIX = "guardian-quality-"
+_UNSET = object()
+
+
+def quality_targets_from_text(text: str) -> list[dict[str, Any]]:
+    """Read enabled quality targets from guardian.yaml using the narrow parser."""
+
+    section = _quality_section_text(text, "quality")
+    if section is None:
+        return []
+    quality = _mapping(_parse_yaml(section, "guardian quality"), "guardian quality")
+    enabled = quality.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("guardian quality.enabled must be boolean")
+    if not enabled:
+        return []
+    raw_targets = quality.get("targets", [])
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise ValueError("enabled guardian quality requires targets")
+    targets: list[dict[str, Any]] = []
+    by_id: dict[str, dict[str, Any]] = {}
+    for index, raw in enumerate(raw_targets):
+        target = _mapping(raw, f"guardian quality.targets[{index}]")
+        target_id = _string(target.get("id"), f"quality target {index}.id")
+        if not _QUALITY_ID_RE.fullmatch(target_id):
+            raise ValueError(f"invalid quality target id {target_id!r}")
+        if target_id in by_id:
+            raise ValueError(f"duplicate quality target id {target_id!r}")
+        source_group = _string(
+            target.get("source_group"),
+            f"quality target {target_id}.source_group",
+        )
+        copied = dict(target)
+        copied.update(id=target_id, source_group=source_group)
+        by_id[target_id] = copied
+        targets.append(copied)
+
+    order = quality.get("order")
+    if order is not None:
+        if not isinstance(order, list) or len(order) != len(targets):
+            raise ValueError("quality.order must list every target exactly once")
+        ordered: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for value in order:
+            target_id = _string(value, "quality.order entry")
+            if target_id in seen or target_id not in by_id:
+                raise ValueError("quality.order contains an unknown or duplicate target")
+            seen.add(target_id)
+            ordered.append(by_id[target_id])
+        targets = ordered
+    return targets
+
+
+def discover_quality_ports(
+    config_text: str,
+    targets: Sequence[Mapping[str, object]],
+    *,
+    proc_tcp: str | None | object = _UNSET,
+    proc_tcp6: str | None | object = _UNSET,
+) -> list[int]:
+    """Choose deterministic, container-local ports for quality listeners.
+
+    Explicit target ports win.  A valid guardian-owned listener is reused when
+    a target has no explicit port.  New ports start at 17990 and advance in
+    order.  Both proc socket tables are required so an unavailable table can
+    never turn a guessed port into a production config change.
+    """
+
+    config = _mapping(_parse_yaml(config_text, "mihomo config"), "mihomo config")
+    configured_ports = _configured_ports(config)
+    listeners = _quality_listener_records(config_text, config)
+    listener_by_name: dict[str, dict[str, Any]] = {}
+    listener_ports: dict[int, str] = {}
+    user_listener_ports: set[int] = set()
+    owned_listener_ports: set[int] = set()
+    owned_listener_target_ports: dict[str, int] = {}
+    owned_by_id: dict[str, dict[str, Any]] = {}
+    for listener in listeners:
+        name = listener["name"]
+        if name in listener_by_name:
+            raise ValueError(f"duplicate listener name {name!r}")
+        listener_by_name[name] = listener
+        port = listener["port"]
+        previous = listener_ports.get(port)
+        if previous is not None:
+            raise ValueError(
+                f"duplicate listener port {port} ({previous!r} and {name!r})"
+            )
+        listener_ports[port] = name
+        owner = listener.get("owner")
+        if owner is None:
+            user_listener_ports.add(port)
+            continue
+        expected_name = _QUALITY_LISTENER_PREFIX + owner
+        if name != expected_name:
+            raise ValueError(
+                f"owned listener {name!r} does not match target {owner!r}"
+            )
+        if (
+            listener.get("type") != "mixed"
+            or listener.get("listen") != "127.0.0.1"
+            or listener.get("proxy") != _QUALITY_GROUP_PREFIX + owner
+        ):
+            raise ValueError(f"owned listener {name!r} is not a valid quality listener")
+        owned_listener_ports.add(port)
+        owned_by_id[owner] = listener
+        owned_listener_target_ports[owner] = port
+
+    bound_ports = read_proc_socket_ports(
+        _socket_text(proc_tcp, "/proc/net/tcp", "tcp"),
+        _socket_text(proc_tcp6, "/proc/net/tcp6", "tcp6"),
+    )
+    blocked = (
+        configured_ports
+        | user_listener_ports
+        | bound_ports
+    ) - owned_listener_ports
+
+    normalised: list[tuple[str, dict[str, Any], int | None]] = []
+    seen_ids: set[str] = set()
+    target_ids = {
+        raw.get("id")
+        for raw in targets
+        if isinstance(raw, Mapping) and isinstance(raw.get("id"), str)
+    }
+    used_ports: set[int] = set()
+    for index, raw in enumerate(targets):
+        target = _mapping(raw, f"quality target {index}")
+        target_id = _string(target.get("id"), f"quality target {index}.id")
+        if not _QUALITY_ID_RE.fullmatch(target_id):
+            raise ValueError(f"invalid quality target id {target_id!r}")
+        if target_id in seen_ids:
+            raise ValueError(f"duplicate quality target id {target_id!r}")
+        seen_ids.add(target_id)
+        source_group = _string(
+            target.get("source_group"), f"quality target {target_id}.source_group"
+        )
+        listener_name = _QUALITY_LISTENER_PREFIX + target_id
+        existing = listener_by_name.get(listener_name)
+        if existing is not None and existing.get("owner") != target_id:
+            raise ValueError(f"quality listener name collision: {listener_name!r}")
+        explicit = _quality_listener_port(target.get("listener"), target_id)
+        if explicit is None and "port" in target:
+            explicit = _quality_port_value(target.get("port"), target_id)
+        port = explicit
+        if port is None and existing is not None:
+            port = existing["port"]
+        if port is not None:
+            if port in used_ports:
+                raise ValueError(f"duplicate quality listener port {port}")
+            if port in blocked and not (
+                existing is not None and existing["port"] == port
+            ):
+                raise ValueError(f"quality listener port {port} is already in use")
+            conflicting_owner = next(
+                (
+                    owner
+                    for owner, owner_port in owned_listener_target_ports.items()
+                    if owner_port == port and owner != target_id
+                ),
+                None,
+            )
+            if conflicting_owner is not None and conflicting_owner in target_ids:
+                raise ValueError(
+                    f"quality listener port {port} belongs to target {conflicting_owner!r}"
+                )
+            used_ports.add(port)
+        normalised.append((target_id, {**target, "source_group": source_group}, port))
+
+    next_port = 17990
+    result: list[int] = []
+    for target_id, target, port in normalised:
+        if port is None:
+            while next_port <= 65535 and (
+                next_port in blocked or next_port in used_ports
+            ):
+                next_port += 1
+            if next_port > 65535:
+                raise ValueError("no safe quality listener port is available")
+            port = next_port
+            used_ports.add(port)
+            next_port += 1
+        result.append(port)
+    return result
+
+
+def prepare_quality_targets(
+    config_text: str,
+    targets: Sequence[Mapping[str, object]],
+    *,
+    proc_tcp: str | None | object = _UNSET,
+    proc_tcp6: str | None | object = _UNSET,
+) -> list[dict[str, Any]]:
+    """Return target mappings with deterministic loopback listener URLs."""
+
+    ports = discover_quality_ports(
+        config_text, targets, proc_tcp=proc_tcp, proc_tcp6=proc_tcp6
+    )
+    prepared = []
+    for raw, port in zip(targets, ports):
+        target = dict(raw)
+        target["listener"] = f"http://127.0.0.1:{port}"
+        prepared.append(target)
+    return prepared
+
+
+def read_proc_socket_ports(tcp_text: str, tcp6_text: str) -> set[int]:
+    """Parse Linux TCP socket tables; empty/unavailable input fails closed."""
+
+    if not isinstance(tcp_text, str) or not tcp_text.strip():
+        raise ValueError("tcp socket table is unavailable")
+    if not isinstance(tcp6_text, str) or not tcp6_text.strip():
+        raise ValueError("tcp6 socket table is unavailable")
+    ports: set[int] = set()
+    for table in (tcp_text, tcp6_text):
+        for line in table.splitlines():
+            fields = line.split()
+            if len(fields) < 2 or fields[0].lower() in {"sl", "local_address"}:
+                continue
+            local_field = next(
+                (
+                    field
+                    for field in fields[:3]
+                    if re.fullmatch(r"[0-9A-Fa-f]+:[0-9A-Fa-f]{4}", field)
+                ),
+                None,
+            )
+            match = (
+                re.fullmatch(r"[0-9A-Fa-f]+:([0-9A-Fa-f]{4})", local_field)
+                if local_field is not None
+                else None
+            )
+            if not match:
+                raise ValueError("tcp socket table has an unsupported row")
+            ports.add(int(match.group(1), 16))
+    return ports
+
+
+def _socket_text(value: str | None | object, path: str, label: str) -> str:
+    if value is _UNSET:
+        try:
+            return Path(path).read_text(encoding="ascii")
+        except OSError as exc:
+            raise ValueError(f"{label} socket table is unavailable") from exc
+    if value is None:
+        raise ValueError(f"{label} socket table is unavailable")
+    if not isinstance(value, str):
+        raise ValueError(f"{label} socket table must be text")
+    return value
+
+
+def _quality_section_text(text: str, section: str) -> str | None:
+    lines = text.splitlines(keepends=True)
+    bounds = _section_bounds(lines, section)
+    if bounds is None:
+        return None
+    return "".join(lines[bounds[0] : bounds[1]])
+
+
+def _configured_ports(config: Mapping[str, Any]) -> set[int]:
+    ports: set[int] = set()
+    for key, value in config.items():
+        if key.endswith("-port"):
+            port = _port(value, key)
+            if port is not None:
+                ports.add(port)
+        elif key == "external-controller":
+            ports.add(_controller_port(value))
+    return ports
+
+
+def _quality_listener_records(
+    text: str, config: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    raw_listeners = config.get("listeners", [])
+    if raw_listeners is None:
+        return []
+    if not isinstance(raw_listeners, list):
+        raise ValueError("mihomo listeners must be a list")
+    section = _quality_section_text(text, "listeners")
+    if section is None:
+        if raw_listeners:
+            raise ValueError("mihomo listeners section could not be located")
+        return []
+    lines = section.splitlines(keepends=True)
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if _indent(line) == 2 and line.lstrip().startswith("-")
+    ]
+    if len(starts) != len(raw_listeners):
+        raise ValueError("mihomo listeners use unsupported indentation")
+    records = []
+    for index, raw in enumerate(raw_listeners):
+        listener = _mapping(raw, f"mihomo listeners[{index}]")
+        name = _string(listener.get("name"), f"mihomo listeners[{index}].name")
+        port = _quality_port_value(listener.get("port"), name)
+        owner = None
+        end = starts[index + 1] if index + 1 < len(starts) else len(lines)
+        for line in lines[starts[index] : end]:
+            match = _QUALITY_OWNER_RE.match(line.rstrip("\r\n").strip())
+            if match:
+                if owner is not None and owner != match.group(1):
+                    raise ValueError("listener has duplicate quality owners")
+                owner = match.group(1)
+        records.append(
+            {
+                "name": name,
+                "port": port,
+                "type": listener.get("type"),
+                "listen": listener.get("listen"),
+                "proxy": listener.get("proxy"),
+                "owner": owner,
+            }
+        )
+    return records
+
+
+def _quality_listener_port(value: object, target_id: str) -> int | None:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"quality target {target_id!r}.listener must be an http URL")
+    parsed = urlsplit(value.strip())
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.port is None
+    ):
+        raise ValueError(
+            f"quality target {target_id!r}.listener must be an http loopback URL"
+        )
+    return _quality_port_value(parsed.port, target_id)
+
+
+def _quality_port_value(value: object, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} port must be an explicit integer")
+    if isinstance(value, int):
+        port = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        port = int(value.strip(), 10)
+    else:
+        raise ValueError(f"{label} port must be an explicit integer")
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{label} port is out of range")
+    return port
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip(" ")) if line.strip() else 99
 
 
 def _group_data(config: Mapping[str, Any]) -> tuple[dict[str, str], dict[str, tuple[str, ...]]]:

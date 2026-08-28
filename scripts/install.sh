@@ -64,11 +64,20 @@ find_compose() {
 find_compose
 COMPOSE_PATH=$(CDPATH= cd -- "$(dirname -- "$COMPOSE_PATH")" && pwd)/$(basename -- "$COMPOSE_PATH")
 PROJECT_DIR=$(dirname -- "$COMPOSE_PATH")
+GUARDIAN_ROOT=${GUARDIAN_ROOT:-$PROJECT_DIR/guardian}
+QUALITY_TEMPLATE="$GUARDIAN_ROOT/guardian.yaml"
+[ -f "$QUALITY_TEMPLATE" ] || QUALITY_TEMPLATE="$REPO_DIR/configs/guardian.example.yaml"
 
 GUARDIAN_TMPDIR=${TMPDIR:-/tmp}
 INSPECT_FILE=$(mktemp "$GUARDIAN_TMPDIR/mihomo-guardian.inspect.XXXXXX")
 DISCOVERY_FILE=$(mktemp "$GUARDIAN_TMPDIR/mihomo-guardian.discovery.XXXXXX")
-cleanup() { rm -f "$INSPECT_FILE" "$DISCOVERY_FILE"; }
+QUALITY_TARGETS_FILE=$(mktemp "$GUARDIAN_TMPDIR/mihomo-guardian.quality-targets.XXXXXX")
+QUALITY_TCP_FILE=$(mktemp "$GUARDIAN_TMPDIR/mihomo-guardian.tcp.XXXXXX")
+QUALITY_TCP6_FILE=$(mktemp "$GUARDIAN_TMPDIR/mihomo-guardian.tcp6.XXXXXX")
+cleanup() {
+    rm -f "$INSPECT_FILE" "$DISCOVERY_FILE" "$QUALITY_TARGETS_FILE" \
+        "$QUALITY_TCP_FILE" "$QUALITY_TCP6_FILE"
+}
 trap cleanup EXIT INT TERM
 
 docker inspect "$CONTAINER" >"$INSPECT_FILE"
@@ -152,7 +161,52 @@ case "$has_secret" in
     *) echo "mihomo controller secret is not configured; refusing to continue" >&2; exit 1 ;;
 esac
 
-GUARDIAN_ROOT=${GUARDIAN_ROOT:-$PROJECT_DIR/guardian}
+QUALITY_DECLARED=$(PYTHONPATH="$REPO_DIR" python3 - "$QUALITY_TEMPLATE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from scripts.discover import quality_targets_from_text
+
+targets = quality_targets_from_text(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(json.dumps(targets, ensure_ascii=False, separators=(",", ":")))
+PY
+)
+case "$QUALITY_DECLARED" in
+    "[]") printf '%s\n' '[]' >"$QUALITY_TARGETS_FILE" ;;
+    *)
+        if ! docker exec "$CONTAINER" cat /proc/net/tcp >"$QUALITY_TCP_FILE"; then
+            echo "quality preflight could not read container /proc/net/tcp; refusing to guess ports" >&2
+            exit 1
+        fi
+        if ! docker exec "$CONTAINER" cat /proc/net/tcp6 >"$QUALITY_TCP6_FILE"; then
+            echo "quality preflight could not read container /proc/net/tcp6; refusing to guess ports" >&2
+            exit 1
+        fi
+        PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$QUALITY_TEMPLATE" "$QUALITY_TCP_FILE" "$QUALITY_TCP6_FILE" "$QUALITY_TARGETS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+from scripts.discover import prepare_quality_targets, quality_targets_from_text
+
+config_text = Path(sys.argv[1]).read_text(encoding="utf-8")
+guardian_text = Path(sys.argv[2]).read_text(encoding="utf-8")
+targets = quality_targets_from_text(guardian_text)
+prepared = prepare_quality_targets(
+    config_text,
+    targets,
+    proc_tcp=Path(sys.argv[3]).read_text(encoding="ascii"),
+    proc_tcp6=Path(sys.argv[4]).read_text(encoding="ascii"),
+)
+Path(sys.argv[5]).write_text(
+    json.dumps(prepared, ensure_ascii=False, separators=(",", ":")) + "\n",
+    encoding="utf-8",
+)
+PY
+        ;;
+esac
+
 echo "discovered container=$CONTAINER"
 echo "discovered service=$DISCOVERED_SERVICE"
 echo "discovered compose=$COMPOSE_PATH"
@@ -178,12 +232,16 @@ printf '%s' "$PATCHED_COMPOSE" | (cd "$PROJECT_DIR" && docker compose -f - confi
     echo "patched compose failed validation" >&2
     exit 1
 }
-PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_MAIN" "$DISCOVERED_BACKUP" <<'PY'
+PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_MAIN" "$DISCOVERED_BACKUP" "$QUALITY_TARGETS_FILE" <<'PY'
+import json
 import sys
 from pathlib import Path
-from scripts.mihomo_config_patch import patch_provider_groups
+from scripts.mihomo_config_patch import patch_provider_groups, patch_quality_targets
 
-patch_provider_groups(Path(sys.argv[1]).read_text(encoding="utf-8"), sys.argv[2], sys.argv[3])
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+patched = patch_provider_groups(text, sys.argv[2], sys.argv[3])
+targets = json.loads(Path(sys.argv[4]).read_text(encoding="utf-8"))
+patch_quality_targets(patched, targets)
 PY
 
 if [ "$PRELIGHT" -eq 1 ]; then
@@ -264,11 +322,18 @@ Path(sys.argv[2]).chmod(0o640)
 PY
 fi
 
-PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_MAIN" "$DISCOVERED_BACKUP" <<'PY'
+PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_MAIN" "$DISCOVERED_BACKUP" "$QUALITY_TARGETS_FILE" <<'PY'
+import json
 import sys
+from pathlib import Path
 from scripts.mihomo_config_patch import patch_file
 
-patch_file(sys.argv[1], sys.argv[2], sys.argv[3])
+patch_file(
+    sys.argv[1],
+    sys.argv[2],
+    sys.argv[3],
+    json.loads(Path(sys.argv[4]).read_text(encoding="utf-8")),
+)
 PY
 
 # Start conservatively. Auto mode is enabled only after the read-only smoke

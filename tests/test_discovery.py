@@ -15,6 +15,8 @@ try:
         load_discovery,
         main,
         render_guardian_config,
+        discover_quality_ports,
+        prepare_quality_targets,
     )
 except ModuleNotFoundError as exc:
     if exc.name not in {"scripts", "scripts.discover"}:
@@ -24,6 +26,8 @@ except ModuleNotFoundError as exc:
     load_discovery = None
     main = None
     render_guardian_config = None
+    discover_quality_ports = None
+    prepare_quality_targets = None
     discover_module = None
     _DISCOVERY_MISSING = True
 else:
@@ -635,3 +639,74 @@ def test_cli_json_and_env_are_safe_for_install_scripts(tmp_path):
     assert "MIHOMO_SECRET_FILE=/root/.config/mihomo/.controller_secret" in env_result.stdout
     assert "MIHOMO_HAS_SECRET=1" in env_result.stdout
     assert "super-secret-token" not in env_result.stdout
+
+
+def test_quality_port_discovery_prefers_existing_ports_and_skips_config_and_socket_ports():
+    config = """mixed-port: 7890
+http-port: 7891
+external-controller: 127.0.0.1:9090
+proxy-groups:
+  - name: MAIN
+    type: select
+    proxies: [DIRECT]
+listeners:
+  - name: guardian-quality-old
+    # mihomo-guardian: generated quality target old
+    type: mixed
+    listen: 127.0.0.1
+    port: 17990
+    proxy: GUARDIAN-QUALITY-old
+  - name: user
+    type: mixed
+    listen: 127.0.0.1
+    port: 17991
+    proxy: DIRECT
+"""
+    targets = [
+        {"id": "old", "source_group": "MAIN", "listener": ""},
+        {"id": "new", "source_group": "MAIN", "listener": ""},
+    ]
+    tcp = "  sl\n  0100007F:4648 00000000:0000 0A 00000000:0000 00:00000000 00000000   100        0 1 2\n"
+    tcp6 = "  sl\n  00000000000000000000000000000000:4642 00000000000000000000000000000000:0000 0A 0\n"
+
+    discovered = discover_quality_ports(
+        config,
+        targets,
+        proc_tcp=tcp,
+        proc_tcp6=tcp6,
+    )
+    assert discovered == [17990, 17993]
+
+    prepared = prepare_quality_targets(
+        config,
+        targets,
+        proc_tcp=tcp,
+        proc_tcp6=tcp6,
+    )
+    assert [target["listener"] for target in prepared] == [
+        "http://127.0.0.1:17990",
+        "http://127.0.0.1:17993",
+    ]
+
+
+def test_quality_port_discovery_fails_closed_without_socket_tables_or_on_user_port_conflict():
+    target = [{"id": "one", "source_group": "MAIN", "listener": ""}]
+    with pytest.raises(ValueError, match="socket"):
+        discover_quality_ports("proxy-groups:\n  - name: MAIN\n", target, proc_tcp=None, proc_tcp6=None)
+
+    with pytest.raises(ValueError, match="port"):
+        discover_quality_ports(
+            "mixed-port: 17990\nproxy-groups:\n  - name: MAIN\n",
+            [{**target[0], "listener": "http://127.0.0.1:17990"}],
+            proc_tcp="sl\n",
+            proc_tcp6="sl\n",
+        )
+
+
+def test_install_contains_read_only_quality_preflight_and_quality_patch_path():
+    script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    assert "prepare_quality_targets" in script
+    assert "patch_quality_targets" in script
+    assert 'docker exec "$CONTAINER" cat /proc/net/tcp' in script
+    assert 'docker exec "$CONTAINER" cat /proc/net/tcp6' in script
+    assert "preflight=ok (no files, services, or containers changed)" in script
