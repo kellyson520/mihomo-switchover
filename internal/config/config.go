@@ -442,7 +442,7 @@ func validate(cfg Config) error {
 	if cfg.Logging.MaxBytes < 1024 || cfg.Logging.Retain < 1 {
 		return errors.New("logging limits are too small")
 	}
-	if err := validateQuality(cfg.Quality); err != nil {
+	if err := validateQuality(cfg.Quality, cfg.Mihomo); err != nil {
 		return err
 	}
 
@@ -484,13 +484,24 @@ func validate(cfg Config) error {
 
 var qualityTargetIDPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
-func validateQuality(quality QualityConfig) error {
+func validateQuality(quality QualityConfig, mihomo MihomoConfig) error {
 	if quality.Enabled && len(quality.Targets) == 0 {
 		return errors.New("quality.enabled requires at least one target")
 	}
 
 	targets := make(map[string]QualityTarget, len(quality.Targets))
 	listeners := make(map[int]string, len(quality.Targets))
+	mihomoPorts := map[int]string{}
+	if port, ok := configuredPort(mihomo.API); ok {
+		mihomoPorts[port] = "mihomo api"
+	}
+	if port, ok := configuredPort(mihomo.Proxy); ok {
+		if existing, exists := mihomoPorts[port]; exists {
+			mihomoPorts[port] = existing + " and mihomo proxy"
+		} else {
+			mihomoPorts[port] = "mihomo proxy"
+		}
+	}
 	for _, target := range quality.Targets {
 		if !qualityTargetIDPattern.MatchString(target.ID) {
 			return fmt.Errorf("invalid quality target id %q", target.ID)
@@ -510,6 +521,9 @@ func validateQuality(quality QualityConfig) error {
 		port, err := validateQualityListener(target.Listener)
 		if err != nil {
 			return fmt.Errorf("quality target %q listener: %w", target.ID, err)
+		}
+		if endpoint, exists := mihomoPorts[port]; exists {
+			return fmt.Errorf("quality target %q listener port %d conflicts with %s port %d", target.ID, port, endpoint, port)
 		}
 		if previous, exists := listeners[port]; exists {
 			return fmt.Errorf("duplicate quality listener port %d for targets %q and %q", port, previous, target.ID)
@@ -570,6 +584,18 @@ func validateQuality(quality QualityConfig) error {
 		return errors.New("quality retention reports and history_days must be positive")
 	}
 	return nil
+}
+
+func configuredPort(raw string) (int, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Port() == "" {
+		return 0, false
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return 0, false
+	}
+	return port, true
 }
 
 func validateQualityListener(raw string) (int, error) {

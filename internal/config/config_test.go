@@ -224,6 +224,90 @@ func TestQualityConfigParsesConfiguredDurations(t *testing.T) {
 	}
 }
 
+func TestQualityConfigRejectsMihomoEndpointListenerPortConflicts(t *testing.T) {
+	tests := []struct {
+		name string
+		port string
+		want string
+	}{
+		{name: "api", port: "9090", want: "conflicts with mihomo api port 9090"},
+		{name: "proxy", port: "7890", want: "conflicts with mihomo proxy port 7890"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := strings.Replace(
+				string(validQualityConfig(t)),
+				"listener: http://127.0.0.1:17990",
+				"listener: http://127.0.0.1:"+tt.port,
+				1,
+			)
+			_, err := LoadBytes([]byte(data))
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error=%v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestQualityConfigRejectsNestedUnknownFields(t *testing.T) {
+	tests := []struct {
+		name string
+		edit string
+	}{
+		{
+			name: "quality",
+			edit: "quality:\n  unknown: true\n  enabled: true",
+		},
+		{
+			name: "target",
+			edit: "    - id: primary\n      unknown: true",
+		},
+		{
+			name: "thresholds",
+			edit: "quality:\n  thresholds:\n    unknown: true\n  enabled: true",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data := string(validQualityConfig(t))
+			switch tt.name {
+			case "quality", "thresholds":
+				data = strings.Replace(data, "quality:\n  enabled: true", tt.edit, 1)
+			case "target":
+				data = strings.Replace(data, "    - id: primary", tt.edit, 1)
+			}
+			_, err := LoadBytes([]byte(data))
+			if err == nil || !strings.Contains(err.Error(), "unknown") {
+				t.Fatalf("error=%v, want nested unknown-field error", err)
+			}
+		})
+	}
+}
+
+func TestQualityConfigRejectsInvalidAddedDurations(t *testing.T) {
+	for _, value := range []string{"0s", "-1s", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			data := strings.Replace(
+				string(validQualityConfig(t)),
+				"quality:\n  enabled: true",
+				"quality:\n  enabled: true\n  full_scan_interval: "+value,
+				1,
+			)
+			_, err := LoadBytes([]byte(data))
+			if err == nil || !strings.Contains(err.Error(), "quality.full_scan_interval") {
+				t.Fatalf("error=%v, want invalid full_scan_interval error", err)
+			}
+		})
+	}
+}
+
+func TestQualityConfigRejectsMissingSourceGroup(t *testing.T) {
+	data := strings.Replace(string(validQualityConfig(t)), "      source_group: MAIN\n", "", 1)
+	if _, err := LoadBytes([]byte(data)); err == nil || !strings.Contains(err.Error(), "requires source_group") {
+		t.Fatalf("error=%v, want missing source_group error", err)
+	}
+}
+
 func TestQualityConfigEnabledRequiresTargets(t *testing.T) {
 	data := append(validMinimalConfig(t), []byte("quality:\n  enabled: true\n")...)
 	if _, err := LoadBytes(data); err == nil || !strings.Contains(err.Error(), "quality.enabled requires at least one target") {
