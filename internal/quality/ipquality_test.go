@@ -36,7 +36,7 @@ func (f *fakeExternalFetcher) Fetch(_ context.Context, spec config.ProbeSpec) (p
 func TestCollectorRequiresExplicitHTTPSAndUsesOnlyInjectedClient(t *testing.T) {
 	client := &fakeExternalFetcher{}
 	c := Collector{
-		Client:  client,
+		client:  client,
 		Sources: []SourceSpec{{ID: "ip", URL: "http://insecure.example/ip", Kind: SourceKindIP, Format: SourceFormatText}},
 	}
 	if _, err := c.Collect(context.Background()); err == nil || !strings.Contains(err.Error(), "https") {
@@ -66,7 +66,7 @@ func TestCollectorGetsIdentityRiskAndAllConfiguredVendorProbesThroughClient(t *t
 	}
 
 	c := Collector{
-		Client: client,
+		client: client,
 		Sources: []SourceSpec{
 			{ID: "ip-a", URL: urls[0], Kind: SourceKindIP, Format: SourceFormatText, Critical: true},
 			{ID: "ip-b", URL: urls[1], Kind: SourceKindIdentity, Format: SourceFormatJSON, Critical: true},
@@ -112,7 +112,7 @@ func TestCollectorPreservesTypedSourceErrorsAndRequiresTwoCriticalAttempts(t *te
 		},
 	}}
 	c := Collector{
-		Client:  client,
+		client:  client,
 		Sources: []SourceSpec{{ID: "broken", URL: sourceURL, Kind: SourceKindIP, Format: SourceFormatText, Critical: true}},
 		Vendors: []VendorProbeSpec{{Vendor: "openai", URL: vendorURL, Critical: true}},
 		Now:     func() time.Time { return time.Date(2026, 8, 28, 0, 0, 0, 0, time.UTC) },
@@ -129,5 +129,135 @@ func TestCollectorPreservesTypedSourceErrorsAndRequiresTwoCriticalAttempts(t *te
 	}
 	if len(got.Errors) < 2 || got.Errors[0].Code != ErrorDNS || got.Errors[1].Code != ErrorHTTP {
 		t.Fatalf("errors=%+v, want typed DNS and HTTP errors", got.Errors)
+	}
+}
+
+func TestParseJSONEvidenceRejectsTrailingGarbage(t *testing.T) {
+	var evidence SourceEvidence
+	err := parseJSONEvidence(&evidence, []byte(`{"ip":"203.0.113.10"} trailing`))
+	if err == nil {
+		t.Fatal("JSON with trailing garbage must be rejected")
+	}
+}
+
+func TestParseJSONEvidencePrefersTopLevelFieldsDeterministically(t *testing.T) {
+	const body = `{"meta":{"ip":"198.51.100.20","country":"CN"},"ip":"203.0.113.10","country":"US"}`
+	for attempt := 0; attempt < 100; attempt++ {
+		var evidence SourceEvidence
+		if err := parseJSONEvidence(&evidence, []byte(body)); err != nil {
+			t.Fatal(err)
+		}
+		if evidence.IP != "203.0.113.10" || evidence.Country != "US" {
+			t.Fatalf("attempt %d evidence=%+v, want deterministic top-level fields", attempt, evidence)
+		}
+	}
+}
+
+func TestParseJSONEvidencePrioritizesTopLevelAliasesOverNestedFields(t *testing.T) {
+	var evidence SourceEvidence
+	const body = `{"details":{"ip":"198.51.100.20","country":"CN"},"ip_address":"203.0.113.10","country_code":"US"}`
+	if err := parseJSONEvidence(&evidence, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.IP != "203.0.113.10" || evidence.Country != "US" {
+		t.Fatalf("evidence=%+v, top-level aliases must beat nested canonical fields", evidence)
+	}
+}
+
+func TestParseJSONEvidenceRetainsAbuseAndBlacklistFields(t *testing.T) {
+	var evidence SourceEvidence
+	if err := parseJSONEvidence(&evidence, []byte(`{"ip":"203.0.113.10","abuse":true,"blacklist":true}`)); err != nil {
+		t.Fatal(err)
+	}
+	if evidence.Abuse == nil || !*evidence.Abuse {
+		t.Fatalf("abuse=%v, want true", evidence.Abuse)
+	}
+	if evidence.Blacklist == nil || !*evidence.Blacklist {
+		t.Fatalf("blacklist=%v, want true", evidence.Blacklist)
+	}
+}
+
+func TestConsensusIdentityUsesTheSameDistinctSourceRuleAsScoring(t *testing.T) {
+	ip, _, complete, conflict := consensusIdentity([]SourceEvidence{
+		{Source: "source-a", URL: "https://a.example/ip", Available: true, IP: "203.0.113.10"},
+		{Source: "source-a", URL: "https://a.example/ip", Available: true, IP: "203.0.113.10"},
+		{Source: "source-b", URL: "https://b.example/ip", Available: true, IP: "203.0.113.11"},
+		{Source: "source-b", URL: "https://b.example/ip", Available: true, IP: "203.0.113.11"},
+	})
+	if complete || !conflict || ip == "" {
+		t.Fatalf("consensus=%q complete=%v conflict=%v, duplicate sources must not manufacture consensus", ip, complete, conflict)
+	}
+}
+
+func TestCollectorFailsClosedWhenSourceBodyReadReportsAnError(t *testing.T) {
+	const sourceURL = "https://identity.example/partial"
+	client := &fakeExternalFetcher{responses: map[string][]fakeFetchResponse{
+		sourceURL: {{
+			result: probe.Result{Class: probe.ReachableHTTP, Status: 200, Err: "unexpected EOF"},
+			body:   "203.0.113.10",
+		}},
+	}}
+	got, err := (&Collector{
+		client:  client,
+		Sources: []SourceSpec{{ID: "partial", URL: sourceURL, Kind: SourceKindIP, Format: SourceFormatText}},
+	}).Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.SourceEvidence) != 1 || got.SourceEvidence[0].Available {
+		t.Fatalf("source evidence=%+v, body read error must not be available", got.SourceEvidence)
+	}
+	if got.SourceEvidence[0].Error == nil || got.SourceEvidence[0].Error.Code != ErrorSourceUnavailable {
+		t.Fatalf("source error=%+v, want source_unavailable", got.SourceEvidence[0].Error)
+	}
+}
+
+func TestCollectorClassifiesContextCancellationBeforeTransportText(t *testing.T) {
+	const sourceURL = "https://identity.example/canceled"
+	client := &fakeExternalFetcher{responses: map[string][]fakeFetchResponse{
+		sourceURL: {{result: probe.Result{Class: probe.NetworkError, Err: "lookup identity.example: context canceled"}}},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	got, err := (&Collector{
+		client:  client,
+		Sources: []SourceSpec{{ID: "canceled", URL: sourceURL, Kind: SourceKindIP, Format: SourceFormatText}},
+	}).Collect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Errors) != 1 || got.Errors[0].Code != ReportErrorCode("canceled") {
+		t.Fatalf("errors=%+v, cancellation must not be classified from lookup text", got.Errors)
+	}
+}
+
+func TestVendorProbesFromConfigSkipsDisabledKnownVendors(t *testing.T) {
+	got := VendorProbesFromConfig([]config.ProbeSpec{
+		{ID: "openai", URL: "https://openai.example/health", Enabled: false},
+		{ID: "gemini", URL: "https://gemini.example/health", Enabled: true},
+	})
+	if len(got) != 1 || got[0].Vendor != "gemini" {
+		t.Fatalf("vendor probes=%+v, disabled openai must be excluded", got)
+	}
+}
+
+func TestCollectorRejectsNonProxyFetcherAtProductionBoundary(t *testing.T) {
+	_, err := (&Collector{Client: &fakeExternalFetcher{}}).Collect(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "probe.NewExternalClient") {
+		t.Fatalf("Collect error=%v, production boundary must reject non-proxied fetchers", err)
+	}
+}
+
+func TestCollectEvidenceRejectsNilProxyClientWithoutPanic(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("nil proxy client panicked: %v", recovered)
+		}
+	}()
+	_, err := CollectEvidence(context.Background(), nil, []SourceSpec{{
+		ID: "ip", URL: "https://identity.example/ip", Kind: SourceKindIP, Format: SourceFormatText,
+	}}, nil)
+	if err == nil {
+		t.Fatal("nil proxy client must be rejected")
 	}
 }

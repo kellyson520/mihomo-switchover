@@ -48,6 +48,7 @@ const (
 	ErrorTCP               ReportErrorCode = "tcp_error"
 	ErrorTLS               ReportErrorCode = "tls_error"
 	ErrorTimeout           ReportErrorCode = "timeout"
+	ErrorCanceled          ReportErrorCode = "canceled"
 	ErrorParse             ReportErrorCode = "parse_error"
 	ErrorIPConflict        ReportErrorCode = "ip_conflict"
 	ErrorProviderUnhealthy ReportErrorCode = "provider_unhealthy"

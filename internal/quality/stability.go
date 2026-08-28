@@ -54,6 +54,9 @@ func AggregateStability(proxies []mihomo.Proxy, node string, now time.Time, cfg 
 		result.Fresh = now.Sub(result.LastSampleAt) <= staleAfter
 	}
 	result.ExpectedSamples = expectedSamples(window, cfg.SummaryInterval)
+	if result.ExpectedSamples <= 0 {
+		return result
+	}
 	if result.ExpectedSamples > 0 {
 		result.CoveragePercent = clampScore(int((float64(result.Samples) * 100 / float64(result.ExpectedSamples)) + 0.5))
 	}
@@ -95,8 +98,15 @@ func AggregateStability(proxies []mihomo.Proxy, node string, now time.Time, cfg 
 }
 
 func expectedSamples(window, interval time.Duration) int {
-	if interval <= 0 {
-		interval = time.Hour
+	if window <= 0 {
+		return 0
+	}
+	// SummaryInterval is the reporting cadence, not mihomo's per-node delay
+	// probe cadence. Mihomo's native default is five minutes; use that as the
+	// conservative lower bound so an hourly summary cannot inflate coverage.
+	const mihomoDelayInterval = 5 * time.Minute
+	if interval <= 0 || interval > mihomoDelayInterval {
+		interval = mihomoDelayInterval
 	}
 	value := int(window / interval)
 	if window%interval != 0 {
@@ -136,8 +146,14 @@ func calculateStabilityScore(snapshot StabilitySnapshot, cfg config.QualityStabi
 	}
 	latencyComponent := latencyScore(snapshot.P50MS, good, bad)
 	jitterScore := latencyScore(snapshot.JitterMS, 0, bad-good)
-	value := float64(snapshot.AvailabilityPercent)*0.50 + float64(latencyComponent)*0.30 + float64(jitterScore)*0.20
-	return roundClamp(value)
+	peakScore := latencyScore(snapshot.MaxMS, good, bad)
+	// A single severe peak is meaningful even when p50/p95 look healthy. Keep
+	// it as a separate component instead of letting it disappear into jitter.
+	value := float64(snapshot.AvailabilityPercent)*0.40 +
+		float64(latencyComponent)*0.25 +
+		float64(jitterScore)*0.15 +
+		float64(peakScore)*0.20
+	return roundClamp(value * float64(snapshot.CoveragePercent) / 100)
 }
 
 func latencyScore(value, good, bad int) int {

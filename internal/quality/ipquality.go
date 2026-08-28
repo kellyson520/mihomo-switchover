@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -80,27 +82,42 @@ type Collection struct {
 
 type Collector struct {
 	Client  ExternalFetcher
+	client  ExternalFetcher
 	Sources []SourceSpec
 	Vendors []VendorProbeSpec
 	Now     func() time.Time
 }
 
 func NewCollector(client *probe.ExternalClient, sources []SourceSpec, vendors []VendorProbeSpec) *Collector {
-	return &Collector{Client: client, Sources: sources, Vendors: vendors}
+	return &Collector{Client: client, client: client, Sources: sources, Vendors: vendors}
 }
 
 // CollectEvidence is the production entry point. The concrete client must be
 // created for the target loopback listener by probe.NewExternalClient before
 // it is passed here.
 func CollectEvidence(ctx context.Context, client *probe.ExternalClient, sources []SourceSpec, vendors []VendorProbeSpec) (Collection, error) {
-	return (&Collector{Client: client, Sources: sources, Vendors: vendors}).Collect(ctx)
+	return NewCollector(client, sources, vendors).Collect(ctx)
 }
 
 func (c *Collector) Collect(ctx context.Context) (Collection, error) {
 	result := Collection{VendorResults: make(map[string]VendorResult)}
-	if c == nil || c.Client == nil {
+	if c == nil {
 		return result, errors.New("quality collector requires an external client")
 	}
+	client := c.client
+	if concrete, ok := client.(*probe.ExternalClient); ok && concrete == nil {
+		return result, errors.New("quality collector requires an external client")
+	}
+	if client == nil {
+		client = c.Client
+		if client == nil {
+			return result, errors.New("quality collector requires an external client")
+		}
+		if _, ok := client.(*probe.ExternalClient); !ok {
+			return result, errors.New("quality collector requires a client created by probe.NewExternalClient")
+		}
+	}
+	c.client = client
 	if err := c.validateEndpoints(); err != nil {
 		return result, err
 	}
@@ -183,9 +200,13 @@ func (c *Collector) collectSource(ctx context.Context, source SourceSpec, now ti
 		ExpectedMin: 200,
 		ExpectedMax: 499,
 	}
-	fetched, body := c.Client.Fetch(ctx, spec)
+	fetched, body := c.client.Fetch(ctx, spec)
 	evidence.HTTPStatus = fetched.Status
 	evidence.LatencyMS = durationMillis(fetched.Duration)
+	if strings.TrimSpace(fetched.Err) != "" {
+		code := classifyProbeResult(ctx, fetched)
+		return sourceFailure(evidence, code, fetched.Err, now)
+	}
 	if fetched.Class == probe.NetworkError || fetched.Status == 0 {
 		code := classifyTransportError(fetched.Err)
 		return sourceFailure(evidence, code, fetched.Err, now)
@@ -236,7 +257,7 @@ func (c *Collector) collectVendor(ctx context.Context, vendor VendorProbeSpec, n
 			ExpectedMin: defaultInt(vendor.ExpectedMin, 200),
 			ExpectedMax: defaultInt(vendor.ExpectedMax, 499),
 		}
-		fetched, _ := c.Client.Fetch(ctx, spec)
+		fetched, _ := c.client.Fetch(ctx, spec)
 		result.LastAttemptAt = now
 		if fetched.Status > 0 {
 			result.StatusCodes = append(result.StatusCodes, fetched.Status)
@@ -244,14 +265,14 @@ func (c *Collector) collectVendor(ctx context.Context, vendor VendorProbeSpec, n
 		if fetched.Duration > 0 {
 			result.LatencyMS = append(result.LatencyMS, durationMillis(fetched.Duration))
 		}
-		if isReachableVendorStatus(fetched.Status) {
+		if strings.TrimSpace(fetched.Err) == "" && isReachableVendorStatus(fetched.Status) {
 			result.SuccessCount++
 			continue
 		}
 		code := ErrorHTTP
 		message := fmt.Sprintf("HTTP status %d", fetched.Status)
-		if fetched.Status == 0 || fetched.Class == probe.NetworkError {
-			code = classifyTransportError(fetched.Err)
+		if fetched.Status == 0 || fetched.Class == probe.NetworkError || fetched.Err != "" {
+			code = classifyProbeResult(ctx, fetched)
 			message = fetched.Err
 		}
 		result.Errors = append(result.Errors, ReportError{Code: code, Source: name, Message: message, ObservedAt: now})
@@ -281,8 +302,24 @@ func sourceFailure(evidence SourceEvidence, code ReportErrorCode, message string
 }
 
 func classifyTransportError(message string) ReportErrorCode {
+	return classifyTransportErrorWithContext(context.Background(), message)
+}
+
+func classifyTransportErrorWithContext(ctx context.Context, message string) ReportErrorCode {
+	if ctx != nil {
+		switch ctx.Err() {
+		case context.Canceled:
+			return ErrorCanceled
+		case context.DeadlineExceeded:
+			return ErrorTimeout
+		}
+	}
 	text := strings.ToLower(message)
 	switch {
+	case strings.Contains(text, "context canceled"), strings.Contains(text, "operation was canceled"):
+		return ErrorCanceled
+	case strings.Contains(text, "context deadline exceeded"):
+		return ErrorTimeout
 	case strings.Contains(text, "timeout"), strings.Contains(text, "deadline"):
 		return ErrorTimeout
 	case strings.Contains(text, "no such host"), strings.Contains(text, "server misbehaving"), strings.Contains(text, "lookup"):
@@ -294,6 +331,13 @@ func classifyTransportError(message string) ReportErrorCode {
 	default:
 		return ErrorSourceUnavailable
 	}
+}
+
+func classifyProbeResult(ctx context.Context, fetched probe.Result) ReportErrorCode {
+	if fetched.Class == probe.NetworkError || fetched.Status == 0 {
+		return classifyTransportErrorWithContext(ctx, fetched.Err)
+	}
+	return ErrorSourceUnavailable
 }
 
 func sanitizeMessage(message string) string {
@@ -344,13 +388,18 @@ func parseJSONEvidence(evidence *SourceEvidence, body []byte) error {
 	if err := decoder.Decode(&document); err != nil {
 		return err
 	}
-	values := make(map[string]any)
-	collectJSONFields(document, values)
-	for _, key := range []string{"ip", "ip_address", "address", "query", "origin"} {
-		if value, ok := values[key]; ok {
-			if err := setEvidenceIP(evidence, fmt.Sprint(value)); err == nil {
-				break
-			}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("JSON response contains trailing data")
+		}
+		return fmt.Errorf("JSON response contains trailing data: %w", err)
+	}
+	values := collectJSONFields(document)
+	if value, ok := firstJSONValue(values, "ip", "ip_address", "address", "query", "origin"); ok {
+		if err := setEvidenceIP(evidence, fmt.Sprint(value)); err != nil {
+			// An explicitly present but malformed high-priority value must not
+			// silently turn lower-priority nested data into trusted identity.
 		}
 	}
 	setStringField(values, "asn", &evidence.ASN, "as", "autonomous_system")
@@ -360,7 +409,9 @@ func parseJSONEvidence(evidence *SourceEvidence, body []byte) error {
 	setBoolField(values, &evidence.Proxy, "proxy", "is_proxy")
 	setBoolField(values, &evidence.VPN, "vpn", "is_vpn")
 	setBoolField(values, &evidence.Tor, "tor", "is_tor")
-	setBoolField(values, &evidence.Blacklisted, "blacklisted", "blacklist", "is_blacklisted")
+	setBoolField(values, &evidence.Blacklisted, "blacklisted", "is_blacklisted", "blacklist")
+	setBoolField(values, &evidence.Blacklist, "blacklist", "is_blacklist", "blacklisted")
+	setBoolField(values, &evidence.Abuse, "abuse", "is_abuse", "abusive")
 	if value, ok := firstJSONValue(values, "abuse_score", "abuse", "risk_score"); ok {
 		if score, err := jsonNumber(value); err == nil {
 			evidence.AbuseScore = &score
@@ -368,39 +419,100 @@ func parseJSONEvidence(evidence *SourceEvidence, body []byte) error {
 	}
 	if evidence.IP == "" && evidence.ASN == "" && evidence.Organization == "" && evidence.Country == "" &&
 		evidence.Hosting == nil && evidence.Proxy == nil && evidence.VPN == nil && evidence.Tor == nil &&
-		evidence.Blacklisted == nil && evidence.AbuseScore == nil {
+		evidence.Blacklisted == nil && evidence.Blacklist == nil && evidence.Abuse == nil && evidence.AbuseScore == nil {
 		return errors.New("JSON response contains no recognized evidence")
 	}
 	return nil
 }
 
-func collectJSONFields(value any, fields map[string]any) {
+type jsonField struct {
+	value any
+	depth int
+	path  string
+}
+
+type jsonFields map[string]jsonField
+
+// collectJSONFields flattens small identity documents without depending on
+// Go's randomized map iteration. All fields at a shallower depth win, which
+// makes top-level values authoritative; nested fields are visited by sorted
+// object key and then array index.
+func collectJSONFields(value any) jsonFields {
+	fields := make(jsonFields)
+	collectJSONFieldsAt(value, 0, "", fields)
+	return fields
+}
+
+func collectJSONFieldsAt(value any, depth int, path string, fields jsonFields) {
 	switch typed := value.(type) {
 	case map[string]any:
-		for key, item := range typed {
-			normalized := strings.ToLower(strings.TrimSpace(key))
-			if _, exists := fields[normalized]; !exists {
-				fields[normalized] = item
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(i, j int) bool {
+			left := strings.ToLower(strings.TrimSpace(keys[i]))
+			right := strings.ToLower(strings.TrimSpace(keys[j]))
+			if left == right {
+				return keys[i] < keys[j]
 			}
-			collectJSONFields(item, fields)
+			return left < right
+		})
+		for _, key := range keys {
+			item := typed[key]
+			normalized := strings.ToLower(strings.TrimSpace(key))
+			fieldPath := path + "." + normalized
+			if path == "" {
+				fieldPath = normalized
+			}
+			if existing, exists := fields[normalized]; !exists || depth < existing.depth ||
+				(depth == existing.depth && fieldPath < existing.path) {
+				fields[normalized] = jsonField{value: item, depth: depth, path: fieldPath}
+			}
+		}
+		for _, key := range keys {
+			item := typed[key]
+			normalized := strings.ToLower(strings.TrimSpace(key))
+			fieldPath := path + "." + normalized
+			if path == "" {
+				fieldPath = normalized
+			}
+			collectJSONFieldsAt(item, depth+1, fieldPath, fields)
 		}
 	case []any:
-		for _, item := range typed {
-			collectJSONFields(item, fields)
+		for index, item := range typed {
+			collectJSONFieldsAt(item, depth+1, fmt.Sprintf("%s[%d]", path, index), fields)
 		}
 	}
 }
 
-func firstJSONValue(fields map[string]any, keys ...string) (any, bool) {
-	for _, key := range keys {
-		if value, ok := fields[key]; ok {
-			return value, true
+func firstJSONValue(fields jsonFields, keys ...string) (any, bool) {
+	var selected jsonField
+	selectedPriority := len(keys)
+	selectedDepth := int(^uint(0) >> 1)
+	selectedPath := ""
+	for priority, key := range keys {
+		key = strings.ToLower(strings.TrimSpace(key))
+		field, ok := fields[key]
+		if !ok {
+			continue
+		}
+		if field.depth < selectedDepth ||
+			(field.depth == selectedDepth && priority < selectedPriority) ||
+			(field.depth == selectedDepth && priority == selectedPriority && (selectedPath == "" || field.path < selectedPath)) {
+			selected = field
+			selectedPriority = priority
+			selectedDepth = field.depth
+			selectedPath = field.path
 		}
 	}
-	return nil, false
+	if selectedPriority == len(keys) {
+		return nil, false
+	}
+	return selected.value, true
 }
 
-func setStringField(fields map[string]any, canonical string, destination *string, alternatives ...string) {
+func setStringField(fields jsonFields, canonical string, destination *string, alternatives ...string) {
 	if value, ok := firstJSONValue(fields, append([]string{canonical}, alternatives...)...); ok {
 		if text := strings.TrimSpace(fmt.Sprint(value)); text != "" && text != "<nil>" {
 			*destination = text
@@ -408,7 +520,7 @@ func setStringField(fields map[string]any, canonical string, destination *string
 	}
 }
 
-func setBoolField(fields map[string]any, destination **bool, keys ...string) {
+func setBoolField(fields jsonFields, destination **bool, keys ...string) {
 	value, ok := firstJSONValue(fields, keys...)
 	if !ok {
 		return
@@ -459,33 +571,8 @@ func setEvidenceIP(evidence *SourceEvidence, raw string) error {
 }
 
 func consensusIdentity(sources []SourceEvidence) (ip, family string, complete, conflict bool) {
-	type vote struct {
-		ip     string
-		family string
-	}
-	votes := make(map[string]vote)
-	counts := make(map[string]int)
-	for _, source := range sources {
-		if !source.Available || net.ParseIP(source.IP) == nil {
-			continue
-		}
-		canonical := net.ParseIP(source.IP).String()
-		if _, exists := votes[canonical]; !exists {
-			votes[canonical] = vote{ip: canonical, family: firstNonEmpty(source.IPFamily, ipFamily(canonical))}
-		}
-		counts[canonical]++
-	}
-	best := 0
-	for candidate, count := range counts {
-		if count > best {
-			best = count
-			ip = candidate
-			family = votes[candidate].family
-		}
-	}
-	complete = best >= 2
-	conflict = len(counts) > 1 && best < 2
-	return
+	identity := ScoreIdentity(sources)
+	return identity.ConsensusIP, ipFamily(identity.ConsensusIP), identity.Complete, identity.Conflict
 }
 
 func ipFamily(raw string) string {
@@ -509,6 +596,9 @@ func VendorProbesFromConfig(probes []config.ProbeSpec) []VendorProbeSpec {
 	}
 	result := make([]VendorProbeSpec, 0, len(probes))
 	for _, item := range probes {
+		if !item.Enabled {
+			continue
+		}
 		name := strings.ToLower(strings.TrimSpace(item.ID))
 		vendor, ok := known[name]
 		if !ok {

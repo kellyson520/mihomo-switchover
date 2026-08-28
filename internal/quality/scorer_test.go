@@ -65,6 +65,18 @@ func TestScoreIdentityFlagsIPConflict(t *testing.T) {
 	}
 }
 
+func TestScoreIdentityDeduplicatesSourcesAndRequiresStrictMajority(t *testing.T) {
+	got := ScoreIdentity([]SourceEvidence{
+		{Source: "source-a", URL: "https://a.example/ip", Available: true, IP: "203.0.113.10"},
+		{Source: "source-a", URL: "https://a.example/ip", Available: true, IP: "203.0.113.10"},
+		{Source: "source-b", URL: "https://b.example/ip", Available: true, IP: "203.0.113.11"},
+		{Source: "source-b", URL: "https://b.example/ip", Available: true, IP: "203.0.113.11"},
+	})
+	if got.Available != 2 || got.Complete || !got.Conflict {
+		t.Fatalf("identity=%+v, duplicate A,A,B,B must not create consensus", got)
+	}
+}
+
 func TestScoreRiskUsesSourceMajority(t *testing.T) {
 	clean := []SourceEvidence{
 		{Source: "risk-a", Kind: "risk", Available: true, Proxy: boolPtr(false), VPN: boolPtr(false), Tor: boolPtr(false), Blacklisted: boolPtr(false)},
@@ -86,6 +98,17 @@ func TestScoreRiskUsesSourceMajority(t *testing.T) {
 	}
 }
 
+func TestScoreRiskIncludesAbuseAndBlacklistFlags(t *testing.T) {
+	got := ScoreRisk([]SourceEvidence{
+		{Source: "risk-a", Available: true, Abuse: boolPtr(true)},
+		{Source: "risk-b", Available: true, Blacklist: boolPtr(true)},
+		{Source: "risk-c", Available: true, Abuse: boolPtr(false)},
+	})
+	if got.RiskyVotes != 2 || got.Score >= 50 || !got.Complete {
+		t.Fatalf("risk=%+v, abuse/blacklist flags must participate in risky majority", got)
+	}
+}
+
 func TestScoreQualityLowersConfidenceWhenSourcesAreMissing(t *testing.T) {
 	got := ScoreQuality(
 		map[string]VendorResult{"openai": {Vendor: "openai", StatusCodes: []int{200}, Attempts: 2}},
@@ -94,6 +117,44 @@ func TestScoreQualityLowersConfidenceWhenSourcesAreMissing(t *testing.T) {
 	)
 	if got.Confidence >= 100 || got.Complete {
 		t.Fatalf("quality=%+v, want incomplete lower-confidence result", got)
+	}
+}
+
+func TestScoreQualityCapsIncompleteEvidenceInsteadOfNormalizingToAHighScore(t *testing.T) {
+	got := ScoreQuality(
+		map[string]VendorResult{"openai": {Vendor: "openai", StatusCodes: []int{200}, Attempts: 2}},
+		nil,
+		nil,
+	)
+	if got.Complete || got.Eligible || got.Confidence >= 70 || got.Score >= 70 {
+		t.Fatalf("quality=%+v, incomplete evidence must be conservative and non-recommendable", got)
+	}
+}
+
+func TestScoreReportRecordsCompleteAndEligibleSeparately(t *testing.T) {
+	vendors := map[string]VendorResult{
+		"openai": {Vendor: "openai", StatusCodes: []int{200}, Attempts: 2},
+		"gemini": {Vendor: "gemini", StatusCodes: []int{401}, Attempts: 2},
+	}
+	complete := ScoreReport(Report{
+		Complete:      true,
+		VendorResults: vendors,
+		SourceEvidence: []SourceEvidence{
+			{Source: "ip-a", Available: true, IP: "203.0.113.10"},
+			{Source: "ip-b", Available: true, IP: "203.0.113.10"},
+		},
+		RiskEvidence: []SourceEvidence{
+			{Source: "risk-a", Available: true, Proxy: boolPtr(false)},
+			{Source: "risk-b", Available: true, Blacklist: boolPtr(false)},
+		},
+	})
+	if !complete.Complete || !complete.Eligible || complete.ConfidencePercent < 70 {
+		t.Fatalf("complete report=%+v, want complete and eligible", complete)
+	}
+
+	incomplete := ScoreReport(Report{Complete: true, VendorResults: vendors})
+	if incomplete.Complete || incomplete.Eligible {
+		t.Fatalf("incomplete report=%+v, must record both gates as false", incomplete)
 	}
 }
 

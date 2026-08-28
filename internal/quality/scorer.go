@@ -3,6 +3,7 @@ package quality
 import (
 	"math"
 	"net"
+	"sort"
 	"strings"
 )
 
@@ -21,6 +22,7 @@ type QualityScoreResult struct {
 	Score               int
 	Confidence          int
 	Complete            bool
+	Eligible            bool
 	Errors              []ReportError
 }
 
@@ -75,14 +77,23 @@ func ScoreQuality(vendors map[string]VendorResult, sources, risks []SourceEviden
 	if availableWeight > 0 {
 		qualityScore = roundClamp(weighted / float64(availableWeight))
 	}
+	confidence := roundClamp(confidenceEstimate(vendorComplete, identity, risk, dataConfidence))
+	eligible := complete && confidence >= 70
+	if !eligible && qualityScore > 69 {
+		// A normalized partial result can otherwise look excellent despite
+		// missing required evidence. Keep it visibly below recommendation
+		// thresholds; callers must also honor Eligible.
+		qualityScore = 69
+	}
 	result := QualityScoreResult{
 		VendorReachability:  vendor,
 		IdentityConsistency: identity.Score,
 		RiskScore:           risk.Score,
 		DataConfidence:      dataConfidence,
 		Score:               qualityScore,
-		Confidence:          roundClamp(confidenceEstimate(vendorComplete, identity, risk, dataConfidence)),
+		Confidence:          confidence,
 		Complete:            complete,
+		Eligible:            eligible,
 	}
 	if identity.Conflict {
 		result.Errors = append(result.Errors, ReportError{Code: ErrorIPConflict, Source: "identity", Message: "IP sources disagree"})
@@ -97,6 +108,7 @@ func CalculateQualityScore(vendors map[string]VendorResult, sources, risks []Sou
 }
 
 func ScoreIdentity(sources []SourceEvidence) IdentityScoreResult {
+	sources = distinctAvailableEvidence(sources)
 	counts := make(map[string]int)
 	families := make(map[string]string)
 	available := 0
@@ -114,13 +126,19 @@ func ScoreIdentity(sources []SourceEvidence) IdentityScoreResult {
 		families[canonical] = firstNonEmpty(source.IPFamily, ipFamily(canonical))
 	}
 	result := IdentityScoreResult{Available: available}
-	for ip, count := range counts {
-		if count > result.Consensus {
+	candidates := make([]string, 0, len(counts))
+	for ip := range counts {
+		candidates = append(candidates, ip)
+	}
+	sort.Strings(candidates)
+	for _, ip := range candidates {
+		count := counts[ip]
+		if count > result.Consensus || (count == result.Consensus && (result.ConsensusIP == "" || ip < result.ConsensusIP)) {
 			result.Consensus = count
 			result.ConsensusIP = ip
 		}
 	}
-	if result.Consensus >= 2 {
+	if result.Consensus >= 2 && result.Consensus*2 > result.Available {
 		result.Complete = true
 		// A single dissenting source is tolerated by the required two-of-three
 		// rule; it remains visible in evidence but does not cause a switch.
@@ -153,6 +171,7 @@ func ScoreIdentity(sources []SourceEvidence) IdentityScoreResult {
 }
 
 func consistencyScore(sources []SourceEvidence, value func(SourceEvidence) string) int {
+	sources = distinctAvailableEvidence(sources)
 	counts := make(map[string]int)
 	available := 0
 	for _, source := range sources {
@@ -185,6 +204,7 @@ func consistencyScore(sources []SourceEvidence, value func(SourceEvidence) strin
 }
 
 func ScoreRisk(sources []SourceEvidence) RiskScoreResult {
+	sources = distinctAvailableEvidence(sources)
 	result := RiskScoreResult{}
 	cleanVotes := 0
 	riskyVotes := 0
@@ -194,7 +214,8 @@ func ScoreRisk(sources []SourceEvidence) RiskScoreResult {
 		}
 		riskKnown := false
 		risky := false
-		for _, value := range []*bool{source.Proxy, source.VPN, source.Tor, source.Hosting, source.Blacklisted} {
+		for _, value := range []*bool{source.Proxy, source.VPN, source.Tor, source.Hosting,
+			source.Blacklisted, source.Blacklist, source.Abuse} {
 			if value != nil {
 				riskKnown = true
 				if *value {
@@ -230,6 +251,39 @@ func ScoreRisk(sources []SourceEvidence) RiskScoreResult {
 		result.Score = 50
 	}
 	result.Complete = result.Available >= 2 && cleanVotes != riskyVotes
+	return result
+}
+
+// distinctAvailableEvidence prevents repeated responses from one configured
+// source (or two IDs pointing at the same URL) from manufacturing a majority.
+// Entries without either identity are ignored because they cannot establish
+// independent provenance safely.
+func distinctAvailableEvidence(sources []SourceEvidence) []SourceEvidence {
+	result := make([]SourceEvidence, 0, len(sources))
+	seenSources := make(map[string]struct{})
+	seenURLs := make(map[string]struct{})
+	for _, source := range sources {
+		if !source.Available {
+			continue
+		}
+		sourceID := strings.ToLower(strings.TrimSpace(source.Source))
+		sourceURL := strings.TrimSpace(source.URL)
+		if sourceID == "" && sourceURL == "" {
+			continue
+		}
+		_, sourceSeen := seenSources[sourceID]
+		_, urlSeen := seenURLs[sourceURL]
+		if (sourceID != "" && sourceSeen) || (sourceURL != "" && urlSeen) {
+			continue
+		}
+		if sourceID != "" {
+			seenSources[sourceID] = struct{}{}
+		}
+		if sourceURL != "" {
+			seenURLs[sourceURL] = struct{}{}
+		}
+		result = append(result, source)
+	}
 	return result
 }
 
@@ -339,6 +393,7 @@ func ScoreReport(report Report) Report {
 	report.QualityScore = quality.Score
 	report.EffectiveScore = EffectiveScore(report.QualityScore, report.StabilityScore)
 	report.ConfidencePercent = quality.Confidence
+	report.Eligible = report.Complete && quality.Eligible
 	report.Complete = report.Complete && quality.Complete
 	report.Errors = append(report.Errors, quality.Errors...)
 	return report
