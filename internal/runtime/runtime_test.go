@@ -14,6 +14,19 @@ type fakeLink struct {
 	terminated     bool
 }
 
+type reloadableFakeLink struct {
+	fakeLink
+	reloadCalls   int
+	cycleInterval time.Duration
+}
+
+func (f *reloadableFakeLink) Reload() error {
+	f.reloadCalls++
+	return nil
+}
+
+func (f *reloadableFakeLink) CycleInterval() time.Duration { return f.cycleInterval }
+
 func (f *fakeLink) Heartbeat(context.Context) error {
 	index := f.heartbeatCalls
 	f.heartbeatCalls++
@@ -43,8 +56,8 @@ func TestRuntimeExitsAfterMihomoLinkGrace(t *testing.T) {
 	if fake.decisionCalls != 1 {
 		t.Fatalf("decision ran after lost link: %d", fake.decisionCalls)
 	}
-	if !fake.terminated {
-		t.Fatal("mihomo was not terminated")
+	if fake.terminated {
+		t.Fatal("guardian failure terminated mihomo")
 	}
 }
 
@@ -58,5 +71,39 @@ func TestRuntimeStopsCleanlyOnContextCancellation(t *testing.T) {
 	}
 	if fake.terminated {
 		t.Fatal("cancel unexpectedly terminated mihomo")
+	}
+}
+
+func TestRuntimeChecksOptionalConfigReloadAfterHeartbeat(t *testing.T) {
+	fake := &reloadableFakeLink{fakeLink: fakeLink{heartbeats: []error{nil}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for fake.heartbeatCalls == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+	rt := NewRuntime(fake, RuntimeConfig{LinkLossGrace: time.Second, Tick: time.Millisecond})
+	if err := rt.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	if fake.reloadCalls != 1 {
+		t.Fatalf("reload calls=%d", fake.reloadCalls)
+	}
+}
+
+func TestRuntimeUsesReloadedCycleIntervalInsteadOfRunningEveryReloadTick(t *testing.T) {
+	fake := &reloadableFakeLink{
+		fakeLink:      fakeLink{heartbeats: make([]error, 100)},
+		cycleInterval: 50 * time.Millisecond,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	rt := NewRuntime(fake, RuntimeConfig{LinkLossGrace: time.Second, Tick: time.Millisecond})
+	if err := rt.Run(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v", err)
+	}
+	if fake.decisionCalls != 1 {
+		t.Fatalf("decision ran on every reload tick: %d", fake.decisionCalls)
 	}
 }

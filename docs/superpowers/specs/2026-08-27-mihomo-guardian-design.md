@@ -31,15 +31,17 @@
 
 当前代理组语义为 `MAIN`、`BACKUP-USA`、`CHANNEL`、`PROXY`。其中 `CHANNEL` 选择主备，`PROXY` 选择 `CHANNEL` 或 `DIRECT`。新配置通过组名映射兼容该命名，同时允许后续号池使用其他组名。
 
+安装脚本支持直接在 mihomo 项目目录执行，不要求手工填写容器名、IP、控制端口或代理端口。脚本会从当前目录、compose 标签、容器挂载和 mihomo 配置交叉确认目标；多个候选无法唯一确认时只读失败并报告，不猜测修改线上。
+
 ## 3. 方案选择
 
 采用“静态控制器通过挂载注入，控制器作为同容器监督进程”的方案：
 
 - 不修改官方 mihomo 镜像内容；
 - 将静态可执行文件、启动配置和启动器挂载到 mihomo 容器；
-- 将容器启动命令改为守护程序，由守护程序启动并监督 `/mihomo`；
+- 将容器启动命令改为轻量启动脚本；启动脚本启动 `/mihomo`，并独立拉起/重启 guardian；
 - 守护程序和 `/mihomo` 在同一个容器、同一个网络命名空间内；
-- 控制器与 mihomo 建立强生命周期绑定：mihomo API 未就绪时控制器不进入决策循环，运行中 API 连续失联超过宽限时间时控制器先终止 mihomo，再退出容器；
+- guardian 依赖 mihomo 提供本地 API 和代理出口，但 guardian 崩溃、升级、配置错误或 API 失联时不得终止 mihomo；
 - 所有可变数据写到宿主机挂载区；
 - mihomo 镜像升级只需要重新执行一键安装/同步脚本，不需要把业务逻辑重新打进镜像。
 
@@ -49,34 +51,39 @@
 
 控制器是一个静态 Go 程序，职责分为五个边界清晰的模块：
 
-### 4.1 Supervisor
+### 4.1 Container launcher
 
-控制器作为容器 PID 1：
+挂载的 `start-guardian.sh` 作为容器 PID 1，mihomo 是生产代理主进程，guardian 是独立后台子进程：
 
-- 启动 `/mihomo -d /root/.config/mihomo`；
-- 将 SIGTERM/SIGINT 转发给 mihomo，并等待其退出；
-- mihomo 异常退出时记录原因并退出，让 Docker `unless-stopped` 负责恢复；
-- 控制器自身异常退出时同样由 Docker 拉起；
-- 不在控制器内无限重启 mihomo，避免故障时快速重启打满日志或影响号池。
+- 启动 `/mihomo -d /root/.config/mihomo` 并等待它退出；
+- 在 mihomo 存活期间循环拉起 guardian；guardian 非零退出或崩溃时按固定短退避重启 guardian；
+- guardian 退出、卡死或重启不会发送任何信号给 mihomo；
+- 只有 mihomo 自己退出时，启动脚本才结束，让 Docker `unless-stopped` 恢复整个容器；
+- 收到 Docker 停止信号时，启动脚本才同时清理两个子进程。
 
 ### 4.2 Mihomo API 客户端
 
 通过 `http://127.0.0.1:9090` 直连调用 mihomo REST API，认证复用现有 `.controller_secret` 文件，不把密钥打印到日志。控制 API 必须直连容器内回环地址，不能再经过 mihomo 代理，否则会形成循环依赖。使用的接口包括：
 
 - `GET /proxies`：读取渠道、节点和当前选择；
-- `GET /proxies/{node}/delay`：不改变当前流量的单节点快速探测；
+- `GET /providers/proxies/{provider}`：读取 mihomo 已完成的逐节点健康状态和历史；
+- `GET /proxies/{name}/delay`：对当前可直接访问的代理或代理组执行快速探测；
 - `PUT /proxies/{group}`：锁定供应商组节点或切换 `CHANNEL`；
 - `GET /configs`、`PUT /configs`：仅在配置明确开启时执行 mihomo 配置热加载。
 
 普通 API 请求有独立的超时、重试上限和错误分类；普通请求失败只记录 `mihomo_api_request_failed`，不凭请求故障切换渠道。API 心跳和生命周期绑定按下述强绑定规则处理。
 
-启动阶段必须在 `startup_api_timeout` 内完成 API 认证和基础状态读取；超时则终止已经启动的 mihomo 并退出。运行阶段每个探测周期都必须先完成 API 心跳；连续失联达到 `link_loss_grace`（默认 15 秒）后，控制器停止 mihomo 子进程并退出，让 Docker 重新创建同一对进程。失联期间不执行节点扫描、主备切换或 provider 刷新。
+启动阶段必须在 `startup_api_timeout` 内完成 API 认证和基础状态读取；超时则 guardian 自身退出，由启动脚本重启 guardian，不能终止 mihomo。运行阶段每个探测周期都必须先完成 API 心跳；连续失联达到 `link_loss_grace`（默认 15 秒）后，guardian 自身退出，由启动脚本重新拉起。失联期间不执行节点扫描、主备切换或 provider 刷新。
 
 ### 4.3 Probe Engine
 
 探测分为两层，所有访问外部厂商或纯净度服务的 HTTP 请求都必须使用 mihomo 的 `http://127.0.0.1:7890` 代理，控制器禁止直连公网：
 
-1. 节点层：通过直连 mihomo 控制 API 的 `/delay` 对节点进行低成本并发探测；目标请求由 mihomo 通过该节点发出，用于筛选候选节点，不改变当前选择。
+1. 节点层：对 provider-backed 组读取直连 mihomo 控制 API 的 provider 元数据，使用
+   `alive` 和健康历史筛选候选；部分 mihomo Alpha 版本不会把 provider 节点作为
+   `/proxies/<节点>` 资源暴露，因此不临时把每个候选切入生产流量做 `/delay`。
+   没有健康历史的候选保持未知。没有 provider 映射的静态组才使用其 API 支持的
+   `/delay` 路径。
 2. 当前线路层：对当前锁定节点经 mihomo 本地代理访问厂商入口，读取 DNS、TCP、TLS、HTTP 状态和耗时，用于切换决策。
 
 默认厂商探测入口写在控制器配置中，第一版预置：
@@ -132,7 +139,10 @@
 3. 通过基础探测且风险评分最高的节点；
 4. 同分时保持 provider 原始顺序，不随机化。
 
-只要锁定节点仍通过关键厂商检查，就不因为延迟更低的新节点而切换。更换节点需要连续失败证据，并且更换后写入锁定记录。切换主备时，会先恢复目标供应商自己的上次节点，再做一次目标节点验证；验证失败才扫描其他节点。
+只要锁定节点仍通过关键厂商检查，就不因为延迟更低的新节点而切换。更换节点需要连续失败证据，并且更换后写入锁定记录。切换主备时，会先恢复目标供应商自己的上次节点，再读取 mihomo
+`/providers/proxies/<provider>` 中该节点的 `alive` 和健康历史；验证失败才扫描其他节点。
+不临时把每个候选节点切入生产流量做 `/delay`，因为部分 mihomo Alpha 版本不会把
+provider 节点作为 `/proxies/<节点>` API 资源暴露。
 
 ## 6. 配置与持久化布局
 
@@ -154,7 +164,22 @@
 
 `guardian.yaml` 包含 mihomo API 地址、组映射、厂商入口、探测参数、切换阈值、纯净度策略、日志策略和热重载选项。mihomo 原有 `config.yaml`、provider 文件和 controller secret 继续由 mihomo 自己管理；控制器不复制密钥，也不要求号池修改配置。
 
+如果 `guardian.yaml` 不存在，安装器根据自动发现结果生成它；生成后所有运行策略仍集中在这一个文件。发现到的控制端口和代理端口写成容器内回环地址，宿主机发布端口只用于安装器诊断，不作为运行依赖。
+
 状态文件采用临时文件写入后 `rename` 替换，启动时校验 JSON；损坏时保留原文件为 `.corrupt.<timestamp>` 并使用安全默认值。日志使用 JSONL、按大小和天数轮转，所有 URL 查询参数中的 token、secret、key、密码字段统一脱敏。
+
+### 6.1 自动发现
+
+安装器按以下顺序发现目标：
+
+1. 当前目录是否同时包含 compose、mihomo 配置和 provider 目录；
+2. 当前 compose 的 project/service 标签是否对应运行中的 mihomo 容器；
+3. Docker 容器挂载源路径是否能反向定位 compose 工作目录；
+4. 配置中的 `mixed-port`、`http-port`、`socks-port`、`external-controller` 和 `secret`；
+5. 配置代理组中含有 `MAIN`/`BACKUP` 关系的唯一 `CHANNEL` 组，或现有默认命名；
+6. provider `use` 关系和现有组节点，生成稳定的 provider 映射。
+
+容器内 API 始终使用发现出的 `127.0.0.1:<external-controller-port>`，外部探测始终使用发现出的 `http://127.0.0.1:<mixed-port>`；如果只有 SOCKS 端口，则使用 `socks5://127.0.0.1:<socks-port>`。发现器同时校验端口为正整数、配置文件可读、组名确实存在。IP 只用于展示和 compose 诊断，不写死到 guardian 运行逻辑。
 
 ## 7. 热重载与人工控制
 
@@ -173,15 +198,16 @@
 
 ## 8. 故障与安全边界
 
-- 控制器启动时不能访问 mihomo API：终止 mihomo 并退出，等待 Docker 一起重启。
-- 控制器运行中不能访问 mihomo API：在 15 秒宽限期内只重试和记录；超过宽限期先终止 mihomo，再退出，控制器不脱离 mihomo 单独运行。
+- guardian 启动时不能访问 mihomo API：guardian 自身退出，由启动脚本重启，mihomo 和现有代理继续运行。
+- guardian 运行中不能访问 mihomo API：在 15 秒宽限期内只重试和记录；超过宽限期 guardian 自身退出，启动脚本重启 guardian，绝不终止 mihomo。
 - 任何外部探测请求若绕过 mihomo 代理：视为配置/实现错误，探测结果无效，不得据此切换。
-- 当前节点失败但备用节点未验证：保持当前路径并告警，不盲切。
+- 当前节点失败但备用节点未验证：保持当前路径并告警，不盲切。provider 健康元数据
+  不可用或没有健康历史时同样 fail-closed。
 - 厂商整体 5xx 或公共网络故障：通过多节点交叉结果识别为上游故障，不把所有节点判死。
 - provider 更新中：继续使用旧 provider 文件，更新完成并可解析后才切换到新节点集合。
 - provider 节点名称消失：记录锁定失效，按原始 provider 顺序选择首个通过验证的节点。
 - 配置热重载失败：保留上一份有效配置。
-- 进程退出：由 Docker 重启容器；状态和日志在容器外挂载区。
+- guardian 进程退出：由容器内启动脚本重启；只有 mihomo 进程退出才由 Docker 重启容器；状态和日志在容器外挂载区。
 - 控制 API 只绑定容器内 `127.0.0.1` 访问路径；若现有 mihomo 对外监听 9090，安装器不扩大暴露面，并确保 secret 不出现在进程参数和日志中。
 
 安装器在改动 compose、mihomo 配置和 systemd 前逐份创建带时间戳备份，并提供可执行回滚脚本。首次部署执行健康检查、API 读写检查和“无切换演练”，确认通过后才启用自动切换。
@@ -202,18 +228,19 @@
 
 1. 执行一键安装后容器保持原端口和网络连通性；
 2. `docker restart mihomo-cliproxy` 后控制器和 mihomo 都自动恢复，当前渠道与锁定节点从挂载状态恢复；
-3. 模拟 mihomo API 启动超时或运行中失联时，控制器不会继续决策，会终止 mihomo 并退出；
+3. 模拟 mihomo API 启动超时或运行中失联时，guardian 不会继续决策，只退出并被启动脚本重启，mihomo 进程保持运行；
 4. 模拟主渠道连续失败时只切换一次，模拟恢复时按阈值切回；
 5. 模拟 provider 更新、配置错误时号池流量不被误切；
-6. 日志能完整解释每一次探测与切换原因，且不出现 secret、token 或 API Key。
+6. 模拟 guardian 崩溃、配置错误和反复重启时，mihomo 进程及 7890 代理持续可用；
+7. 日志能完整解释每一次探测与切换原因，且不出现 secret、token 或 API Key。
 
 ## 10. 迁移和回滚
 
 安装流程顺序：
 
 
-1. 检查 Docker、现有容器、配置、挂载和旧 systemd 服务；
-2. 在 `/opt/mihomo-cliproxy/guardian` 创建数据目录并写入默认配置；
+1. 从当前 mihomo 目录/容器自动发现 Docker、容器、配置、挂载、端口、组映射和旧 systemd 服务；发现歧义时停止，不改线上；
+2. 在发现出的 mihomo 挂载目录下创建 `guardian` 数据目录并写入生成配置；
 3. 备份现有 compose、mihomo 配置和旧切换器；
 4. 停止旧 systemd 切换器，确保只有一个控制器写 API；
 5. 将 `MAIN`、`BACKUP-USA` 调整为稳定选择组，保留原 provider 和 `CHANNEL/PROXY` 关系；

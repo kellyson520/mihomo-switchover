@@ -10,6 +10,7 @@ import (
 	"mihomo-guardian/internal/logging"
 	"mihomo-guardian/internal/mihomo"
 	"mihomo-guardian/internal/probe"
+	"mihomo-guardian/internal/purity"
 	"mihomo-guardian/internal/state"
 )
 
@@ -19,8 +20,16 @@ type API interface {
 	Delay(context.Context, string, string, time.Duration) (int, error)
 }
 
+type ProviderAPI interface {
+	GetProvider(context.Context, string) (mihomo.Provider, error)
+}
+
 type ExternalProbe interface {
 	Check(context.Context, config.ProbeSpec) probe.Result
+}
+
+type ExternalFetcher interface {
+	Fetch(context.Context, config.ProbeSpec) (probe.Result, []byte)
 }
 
 type Service struct {
@@ -37,35 +46,44 @@ type Service struct {
 func NewService(cfg config.Config, api API, external ExternalProbe, store *state.Store, logger *logging.Logger) *Service {
 	return &Service{
 		cfg: cfg, api: api, external: external, store: store, logger: logger,
-		engine: decision.NewEngine(decision.DecisionConfig{
-			MainChannel:            cfg.Groups.Main,
-			BackupChannel:          cfg.Groups.Backup,
-			FailuresBeforeSwitch:   cfg.Decision.FailuresBeforeSwitch,
-			RecoveriesBeforeSwitch: cfg.Decision.RecoveriesBeforeSwitch,
-			MinHold:                cfg.Decision.MinHold,
-		}),
+		engine: newDecisionEngine(cfg),
 	}
 }
 
+func newDecisionEngine(cfg config.Config) *decision.Engine {
+	return decision.NewEngine(decision.DecisionConfig{
+		MainChannel:            cfg.Groups.Main,
+		BackupChannel:          cfg.Groups.Backup,
+		FailuresBeforeSwitch:   cfg.Decision.FailuresBeforeSwitch,
+		RecoveriesBeforeSwitch: cfg.Decision.RecoveriesBeforeSwitch,
+		MinHold:                cfg.Decision.MinHold,
+	})
+}
+
+func (s *Service) UpdateConfig(cfg config.Config) {
+	s.cfg = cfg
+	s.engine = newDecisionEngine(cfg)
+}
+
 func (s *Service) RunCycle(ctx context.Context) error {
-	if !s.loaded {
-		loaded, err := s.store.Load()
-		if err != nil {
-			return fmt.Errorf("load state: %w", err)
-		}
-		s.state, s.loaded = loaded, true
+	loaded, err := s.store.Load()
+	if err != nil {
+		return fmt.Errorf("load state: %w", err)
 	}
+	s.state, s.loaded = loaded, true
+
 	channel, err := s.api.GetProxy(ctx, s.cfg.Groups.Channel)
 	if err != nil {
 		return fmt.Errorf("read channel group: %w", err)
 	}
-	if channel.Now == s.cfg.Groups.Main || channel.Now == s.cfg.Groups.Backup {
-		if s.state.CurrentChannel != channel.Now {
-			s.state.CurrentChannel = channel.Now
-			s.state.FailureStreak = 0
-			s.state.RecoveryStreak = 0
-			s.log("channel_state_synced", map[string]any{"channel": channel.Now})
-		}
+	if channel.Now != s.cfg.Groups.Main && channel.Now != s.cfg.Groups.Backup {
+		return fmt.Errorf("unexpected channel selection %q; refusing automatic decision", channel.Now)
+	}
+	if s.state.CurrentChannel != channel.Now {
+		s.state.CurrentChannel = channel.Now
+		s.state.FailureStreak = 0
+		s.state.RecoveryStreak = 0
+		s.log("channel_state_synced", map[string]any{"channel": channel.Now})
 	}
 
 	mainGroup, err := s.api.GetProxy(ctx, s.cfg.Groups.Main)
@@ -92,6 +110,7 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	} else {
 		return fmt.Errorf("unknown current channel %q", s.state.CurrentChannel)
 	}
+	s.assessPurity(ctx)
 
 	action := s.engine.Evaluate(s.state, decision.Input{
 		CurrentHealthy: mainHealthy,
@@ -113,6 +132,20 @@ func (s *Service) RunCycle(ctx context.Context) error {
 		return fmt.Errorf("save state: %w", err)
 	}
 	return nil
+}
+
+func (s *Service) assessPurity(ctx context.Context) {
+	if !s.cfg.Purity.Enabled || len(s.cfg.Purity.URLs) == 0 {
+		return
+	}
+	fetcher, ok := s.external.(ExternalFetcher)
+	if !ok {
+		s.log("purity_unknown", map[string]any{"reason": "external_fetcher_unavailable"})
+		return
+	}
+	lookups := purity.Collect(ctx, fetcher, s.cfg.Purity.URLs)
+	result := purity.Assess(lookups)
+	s.log("purity_advisory", map[string]any{"score": result.Score, "warning": result.Warning, "ip": result.IP})
 }
 
 func (s *Service) activeHealthy(ctx context.Context) bool {
@@ -146,15 +179,29 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 			nodes = append(nodes, group.Now)
 		}
 	}
+	if s.state.ProviderLocks == nil {
+		s.state.ProviderLocks = make(map[string]state.ProviderLock)
+	}
 	lock := s.state.ProviderLocks[provider]
+	stickyNode := lock.Node
+	if stickyNode == "" {
+		// On first adoption, preserve the node already carrying traffic when
+		// mihomo has verified it.  This avoids an unnecessary node change just
+		// because the persisted lock has not been created yet.
+		stickyNode = group.Now
+	}
+	providerNodes, providerAvailable := s.providerNodes(ctx, provider)
+	if s.providerName(provider) != "" && !providerAvailable {
+		return "", false
+	}
 	candidates := make([]decision.Candidate, 0, len(nodes))
 	for order, node := range nodes {
-		healthy, delay := s.nodeHealthy(ctx, node)
+		healthy, delay := s.nodeHealthy(ctx, node, providerNodes)
 		if healthy {
 			candidates = append(candidates, decision.Candidate{Name: node, Healthy: true, Score: -delay, Order: order})
 		}
 	}
-	chosen := decision.ChooseNode(lock.Node, candidates)
+	chosen := decision.ChooseNode(stickyNode, candidates)
 	if chosen == "" {
 		s.log("provider_unverified", map[string]any{"provider": provider, "group": groupName})
 		return "", false
@@ -170,7 +217,51 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 	return chosen, true
 }
 
-func (s *Service) nodeHealthy(ctx context.Context, node string) (bool, int) {
+func (s *Service) providerName(provider string) string {
+	if provider == "main" {
+		return s.cfg.Providers.Main
+	}
+	if provider == "backup" {
+		return s.cfg.Providers.Backup
+	}
+	return ""
+}
+
+func (s *Service) providerNodes(ctx context.Context, provider string) (map[string]mihomo.Proxy, bool) {
+	providerName := s.providerName(provider)
+	if providerName == "" {
+		return nil, true
+	}
+	providerAPI, ok := s.api.(ProviderAPI)
+	if !ok {
+		s.log("provider_health_unavailable", map[string]any{"provider": provider, "name": providerName, "reason": "api_does_not_support_provider_metadata"})
+		return nil, false
+	}
+	metadata, err := providerAPI.GetProvider(ctx, providerName)
+	if err != nil {
+		s.log("provider_health_unavailable", map[string]any{"provider": provider, "name": providerName, "error": err.Error()})
+		return nil, false
+	}
+	result := make(map[string]mihomo.Proxy, len(metadata.Proxies))
+	for _, node := range metadata.Proxies {
+		if node.Name != "" {
+			result[node.Name] = node
+		}
+	}
+	return result, true
+}
+
+func (s *Service) nodeHealthy(ctx context.Context, node string, providerNodes map[string]mihomo.Proxy) (bool, int) {
+	if providerNodes != nil {
+		candidate, ok := providerNodes[node]
+		if !ok || !candidate.Alive {
+			return false, 0
+		}
+		if delay, ok := latestDelay(candidate.History); ok {
+			return true, delay
+		}
+		return false, 0
+	}
 	passed, total, delaySum := 0, 0, 0
 	for _, item := range s.cfg.Probes {
 		if !item.Enabled || !item.Critical {
@@ -184,6 +275,19 @@ func (s *Service) nodeHealthy(ctx context.Context, node string) (bool, int) {
 		}
 	}
 	return total > 0 && passed >= s.cfg.Decision.CriticalQuorum, delaySum
+}
+
+func latestDelay(history []mihomo.DelayHistory) (int, bool) {
+	if len(history) == 0 {
+		return 0, false
+	}
+	latest := history[0]
+	for _, item := range history[1:] {
+		if item.Time.After(latest.Time) {
+			latest = item
+		}
+	}
+	return latest.Delay, true
 }
 
 func (s *Service) applyChannelSwitch(ctx context.Context, channel string) error {

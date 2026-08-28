@@ -1,0 +1,337 @@
+# Guardian 配置说明
+
+本文档描述注入 `mihomo-cliproxy` 后的唯一行为配置文件。号池不在 mihomo 容器
+内，guardian 不读取或修改号池业务。
+
+## 配置位置和职责
+
+生产文件是宿主机挂载区中的：
+
+```text
+/opt/mihomo-cliproxy/guardian/guardian.yaml
+```
+
+实际路径由安装器根据 Compose 和 Docker 挂载自动发现，若部署路径不同，以
+`docker inspect` 或 `status.sh --read-only` 显示的 `guardian_root` 为准。仓库中的
+[`configs/guardian.example.yaml`](../configs/guardian.example.yaml) 只是模板，不是
+生产运行文件。
+
+只编辑这一份 `guardian.yaml`。安装器会从 mihomo 配置发现容器内 API、代理端口、
+主备组和 provider，并只重写配置中的基础设施段；`decision`、`probes`、`purity`、
+`logging` 和 `reload` 等行为段由模板/现有配置保留。
+
+不要在文件中写入控制器 secret、厂商 API key、订阅 token 或账号信息。控制器 secret
+应保存在挂载区的：
+
+```text
+/opt/mihomo-cliproxy/guardian/controller_secret
+```
+
+权限应限制为 guardian 可读（通常 `0640`）。日志会对 URL 查询参数中的 token、secret、
+key 和 password 做脱敏，但不要把脱敏当作可以记录 secret 的理由。
+
+## 完整配置骨架
+
+```yaml
+mihomo:
+  api: http://127.0.0.1:9090
+  proxy: http://127.0.0.1:7890
+  secret_file: /guardian/controller_secret
+
+groups:
+  channel: CHANNEL
+  main: MAIN
+  backup: BACKUP-USA
+
+providers:
+  main: main-channel
+  backup: backup-channel
+
+decision:
+  mode: observe
+  interval: 15s
+  failures_before_switch: 3
+  recoveries_before_switch: 2
+  min_hold: 120s
+  link_loss_grace: 15s
+  startup_api_timeout: 60s
+  critical_quorum: 2
+
+probes:
+  - id: openai
+    url: https://api.openai.com/v1/models
+    critical: true
+    enabled: true
+    method: GET
+    timeout: 5s
+    delay_timeout: 5s
+    expected_min: 200
+    expected_max: 499
+  - id: gemini
+    url: https://generativelanguage.googleapis.com/v1beta/models
+    critical: true
+
+purity:
+  enabled: true
+  automatic_switch: false
+  urls:
+    - https://api.ipify.org
+    - https://ipinfo.io/json
+  timeout: 5s
+
+logging:
+  max_bytes: 10485760
+  retain: 7
+
+reload:
+  check_interval: 2s
+```
+
+上面的组名和 provider 名称是示例占位符；首次部署应让安装器自动发现并替换，不能
+直接把占位符当作线上实际名称。
+
+持续运行时，guardian 在 mihomo API 心跳成功后检查配置文件。完整解析和校验成功才
+会替换内存配置；错误文件继续使用上一份有效配置，并写入
+`config_reload_failed`。有效热重载写入 `config_reloaded`。
+
+## 字段说明
+
+### `mihomo`
+
+| 字段 | 说明 |
+| --- | --- |
+| `api` | mihomo 控制 API，只允许容器内 loopback 的 HTTP URL，例如 `http://127.0.0.1:9090`。guardian 直接访问，不走公网代理。 |
+| `proxy` | 公网探测出口，只允许 loopback 的 HTTP/HTTPS/SOCKS5 URL。所有 OpenAI、Gemini、Anthropic、OpenRouter、DeepSeek 和纯净度请求都必须走这里。 |
+| `secret_file` | 控制 API secret 的容器内文件路径。默认命令参数是 `/guardian/controller_secret`；改此字段需要重启 guardian。 |
+
+### `groups`
+
+| 字段 | 说明 |
+| --- | --- |
+| `channel` | 实际承载流量的主备选择器，例如 `CHANNEL`。guardian 只允许它当前选择 `main` 或 `backup`。 |
+| `main` | 主渠道的 mihomo proxy group 名称。 |
+| `backup` | 备用渠道的 mihomo proxy group 名称。 |
+
+组名必须与 mihomo 控制 API 返回的 `/proxies` 完全一致。修改组关系不是普通热重载，
+需要重新部署/重启 guardian；改错时 guardian 会拒绝自动决策。
+
+### `providers`
+
+`main` 和 `backup` 必须同时填写或同时留空。填写时值是 mihomo 的 provider 名称，
+不是订阅 URL。安装器从 `proxy-groups.<name>.use` 自动发现并填充。
+
+guardian 使用：
+
+```text
+GET /providers/proxies/<provider>
+```
+
+作为节点健康依据。候选节点必须在 provider 返回结果中存在、`alive: true`，并且有
+非空 `history`；没有健康历史的节点保持未知并拒绝切换（fail-closed）。provider
+元数据不可用时，不会退回“猜测一个节点”。
+
+每个 provider 的上次成功节点写入持久化状态：
+
+```text
+/opt/mihomo-cliproxy/guardian/data/state.json
+```
+
+下次检查优先复用该节点；节点仍健康时不因一次延迟波动随机更换，从而降低出口变化
+和号池风控风险。若没有 provider 配置，guardian 才使用 mihomo 的节点 delay API
+验证候选；该检查不会把候选临时切入生产流量。
+
+### `decision`
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `mode` | `auto` | `observe` 只记录应切换动作，`auto` 才执行自动切换。`force` 仅为兼容保留，日常生产不要设置；人工强制状态由 `switch` 命令写入状态文件。首次部署应使用 `observe`。 |
+| `interval` | `15s` | 业务探测/决策周期。 |
+| `failures_before_switch` | `3` | 当前渠道连续失败次数达到该值才允许切换。 |
+| `recoveries_before_switch` | `2` | 当前在备用渠道时，主渠道恢复确认所需的连续成功次数。 |
+| `min_hold` | `120s` | 切换后的最短保持时间，防止来回抖动。 |
+| `link_loss_grace` | `15s` | mihomo 控制 API 连续失联多久后 guardian 自身退出，由 launcher 仅重启 guardian。改动需要重启 guardian。 |
+| `startup_api_timeout` | `60s` | guardian 启动时等待 mihomo API 的最长时间。改动需要重启 guardian。 |
+| `critical_quorum` | `2` | 至少多少个启用的 critical 探测成功才算渠道健康，不能大于 critical 探测数。 |
+
+只有达到失败阈值、恢复阈值、最短保持时间和候选节点健康条件时才切换。纯净度评分
+不参与这个决策。
+
+### `probes`
+
+每个探测包含 `id`、`url`、`critical`，可选 `enabled`、`method`、`timeout`、
+`delay_timeout`、`expected_min` 和 `expected_max`。默认方法为 `GET`，默认超时为
+`5s`，默认可接受状态范围为 `200–499`。
+
+探测分类规则是：
+
+- `200–499`（包括常见的 `401`、`403`、`429`）表示厂商入口可达，不要求 API key；
+- `5xx` 表示上游服务错误，本次失败；
+- DNS、TCP、TLS、代理连接和超时错误表示本次失败；
+- 其他不在期望范围内的状态记录为 `unexpected_http`。
+
+因此，401/403 不能单独证明账号可用，也不能单独证明线路失效；它们只证明厂商入口
+通过当前代理可达。调整 `expected_min/max` 前必须确认不会把认证错误误判成线路故障。
+
+推荐至少保留 OpenAI 和 Gemini 两个 `critical: true` 探测；可按实际号池增加
+Anthropic、OpenRouter、DeepSeek，但不要把单一厂商当成唯一切换依据。
+
+所有这些请求由 guardian 的 HTTP 客户端显式使用 `mihomo.proxy`，不会因为宿主机的
+`HTTP_PROXY`/`HTTPS_PROXY` 环境变量而绕过 mihomo。探测 URL 仍应使用 HTTPS。
+
+### `purity`
+
+启用后通过 mihomo 代理访问多个 IP/ASN 查询 URL，输出 `purity_advisory` 日志，包括
+IP 冲突、国家冲突、数据中心 ASN 或 ASN 未知等告警和评分。
+
+`automatic_switch` 当前只能保持 `false`：纯净度是辅助诊断信号，不是自动切换条件；
+即使评分异常，也不会仅凭一次样本改变渠道。需要人工处理时，先查看多次日志、当前
+provider 健康历史和厂商探测结果，再按运维命令执行有审计记录的人工切换。
+
+### `logging` 与 `reload`
+
+日志文件位于：
+
+```text
+/opt/mihomo-cliproxy/guardian/logs/guardian.jsonl
+/opt/mihomo-cliproxy/guardian/logs/launcher.log
+```
+
+`logging.max_bytes` 控制 JSONL 轮转阈值，`logging.retain` 控制保留份数。两者需要
+重启 guardian 才能让新的 logger 参数生效。`reload.check_interval` 控制配置文件检查
+频率，可热重载。
+
+常用事件包括 `probe`、`purity_advisory`、`node_verified`、`provider_unverified`、
+`switch_observed`、`channel_switched`、`config_reloaded` 和
+`config_reload_failed`。日志中不应出现 secret 或 API key。
+
+## 热重载矩阵
+
+### 可热重载字段
+
+修改合法文件后，以下字段会在下一个心跳/检查周期应用：
+
+- `decision.mode`
+- `decision.interval`
+- `decision.failures_before_switch`
+- `decision.recoveries_before_switch`
+- `decision.min_hold`
+- `decision.critical_quorum`
+- `probes` 的内容和探测参数
+- `purity` 的内容
+- `reload.check_interval`
+
+### 需要重启 guardian 的字段
+
+以下字段属于已建立连接或进程级资源，修改后不能依赖热重载：
+
+- `mihomo.api`
+- `mihomo.proxy`
+- `mihomo.secret_file`
+- `groups`
+- `providers`
+- `logging`
+- `decision.link_loss_grace`
+- `decision.startup_api_timeout`
+
+安全做法是只重启 guardian 子进程，让 launcher 自动拉起它；不要重启或停止 mihomo。
+若改动涉及 Compose 挂载、mihomo 原配置或容器入口，则属于容器级变更，必须走安装器
+的备份、预检和回滚流程。
+
+## 配置修改标准流程
+
+### 1. 先观察并备份
+
+```sh
+sudo ./scripts/status.sh --read-only
+docker exec mihomo-cliproxy sh -c 'cp -p /guardian/guardian.yaml /guardian/guardian.yaml.bak'
+```
+
+如果生产根目录在宿主机可见，也可以在宿主机对实际挂载文件做带时间戳的备份。不要
+覆盖 `guardian.yaml` 的临时写入过程；编辑器应写入同一挂载目录，并保持文件权限。
+
+### 2. 只改一个配置文件并校验
+
+先在仓库模板/临时副本中检查 YAML，再将变更同步到生产挂载区。生产校验命令：
+
+```sh
+docker exec mihomo-cliproxy /guardian/bin/guardian reload \
+  --config /guardian/guardian.yaml
+```
+
+该命令只解析和校验，不会主动切换渠道；常驻 guardian 会在下一次检查时应用可热重载
+字段。
+
+### 3. 观察应用结果
+
+```sh
+docker exec mihomo-cliproxy sh -c \
+  'tail -n 50 /guardian/logs/guardian.jsonl'
+sudo ./scripts/status.sh --read-only
+```
+
+确认看到 `config_reloaded`，没有连续的 `config_reload_failed`，并检查当前渠道、主备
+节点和 mihomo 进程仍在运行。首次部署或探测规则变化后，先保持：
+
+```yaml
+decision:
+  mode: observe
+```
+
+观察到的切换理由合理、连续多个周期稳定后，才执行：
+
+```sh
+docker exec mihomo-cliproxy /guardian/bin/guardian auto \
+  --config /guardian/guardian.yaml
+```
+
+注意：`auto` 清除人工强制状态；它不是容器重启，也不应停止 mihomo。
+
+### 4. 配置失败时恢复
+
+如果校验失败或日志出现错误，立即恢复备份，再次校验并观察：
+
+```sh
+docker exec mihomo-cliproxy sh -c \
+  'cp -p /guardian/guardian.yaml.bak /guardian/guardian.yaml'
+docker exec mihomo-cliproxy /guardian/bin/guardian reload \
+  --config /guardian/guardian.yaml
+```
+
+如果只是配置热重载失败，旧配置仍在内存中，mihomo 不受影响。若 guardian 需要重新
+启动，确认进程身份后只终止 guardian 子进程，等待 launcher 自动重启；不要给 mihomo
+PID 发信号。
+
+## 只读诊断与切换命令
+
+```sh
+sudo ./scripts/status.sh --read-only
+docker exec mihomo-cliproxy /guardian/bin/guardian status --config /guardian/guardian.yaml
+docker exec mihomo-cliproxy /guardian/bin/guardian probe --config /guardian/guardian.yaml
+docker exec mihomo-cliproxy /guardian/bin/guardian switch backup --config /guardian/guardian.yaml
+docker exec mihomo-cliproxy /guardian/bin/guardian auto --config /guardian/guardian.yaml
+```
+
+`status` 和 `probe` 是诊断命令；`switch` 是人工变更，会写入审计日志并产生 30 分钟
+保护期。人工切换前要确认目标 provider 有 `alive` 和健康历史。`auto` 用于恢复自动
+决策。
+
+## 失败处置和回滚
+
+guardian 的 API 失联、配置错误、探测异常或自身崩溃不应影响 mihomo；launcher 会仅
+重启 guardian。先保存日志和状态，再处理根因：
+
+```sh
+docker exec mihomo-cliproxy sh -c \
+  'tail -n 200 /guardian/logs/guardian.jsonl; cat /guardian/data/state.json'
+```
+
+安装器造成的 Compose、mihomo 原配置或挂载变更使用仓库回滚脚本：
+
+```sh
+sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
+```
+
+该脚本会恢复最近的完整备份并重建目标 Compose 服务，因此属于容器级应急操作，可能
+短暂重启 mihomo；执行前确认备份清单和业务维护窗口。它保留 guardian 的日志、状态和
+备份目录，不删除排查证据。不要手工执行 `docker compose down`，不要 force push 或
+删除备份目录。

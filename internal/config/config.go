@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -14,13 +15,14 @@ import (
 )
 
 type Config struct {
-	Mihomo   MihomoConfig   `yaml:"mihomo"`
-	Groups   GroupsConfig   `yaml:"groups"`
-	Decision DecisionConfig `yaml:"decision"`
-	Probes   []ProbeSpec    `yaml:"probes"`
-	Purity   PurityConfig   `yaml:"purity"`
-	Logging  LoggingConfig  `yaml:"logging"`
-	Reload   ReloadConfig   `yaml:"reload"`
+	Mihomo    MihomoConfig    `yaml:"mihomo"`
+	Groups    GroupsConfig    `yaml:"groups"`
+	Providers ProvidersConfig `yaml:"providers"`
+	Decision  DecisionConfig  `yaml:"decision"`
+	Probes    []ProbeSpec     `yaml:"probes"`
+	Purity    PurityConfig    `yaml:"purity"`
+	Logging   LoggingConfig   `yaml:"logging"`
+	Reload    ReloadConfig    `yaml:"reload"`
 }
 
 type MihomoConfig struct {
@@ -35,6 +37,11 @@ type GroupsConfig struct {
 	Backup  string `yaml:"backup"`
 }
 
+type ProvidersConfig struct {
+	Main   string `yaml:"main"`
+	Backup string `yaml:"backup"`
+}
+
 type DecisionConfig struct {
 	Mode                   string        `yaml:"mode"`
 	Interval               time.Duration `yaml:"-"`
@@ -42,6 +49,7 @@ type DecisionConfig struct {
 	RecoveriesBeforeSwitch int           `yaml:"recoveries_before_switch"`
 	MinHold                time.Duration `yaml:"-"`
 	LinkLossGrace          time.Duration `yaml:"-"`
+	StartupAPITimeout      time.Duration `yaml:"-"`
 	CriticalQuorum         int           `yaml:"critical_quorum"`
 }
 
@@ -74,13 +82,14 @@ type ReloadConfig struct {
 }
 
 type rawConfig struct {
-	Mihomo   MihomoConfig  `yaml:"mihomo"`
-	Groups   GroupsConfig  `yaml:"groups"`
-	Decision rawDecision   `yaml:"decision"`
-	Probes   []rawProbe    `yaml:"probes"`
-	Purity   rawPurity     `yaml:"purity"`
-	Logging  LoggingConfig `yaml:"logging"`
-	Reload   rawReload     `yaml:"reload"`
+	Mihomo    MihomoConfig    `yaml:"mihomo"`
+	Groups    GroupsConfig    `yaml:"groups"`
+	Providers ProvidersConfig `yaml:"providers"`
+	Decision  rawDecision     `yaml:"decision"`
+	Probes    []rawProbe      `yaml:"probes"`
+	Purity    rawPurity       `yaml:"purity"`
+	Logging   LoggingConfig   `yaml:"logging"`
+	Reload    rawReload       `yaml:"reload"`
 }
 
 type rawDecision struct {
@@ -90,6 +99,7 @@ type rawDecision struct {
 	RecoveriesBeforeSwitch int    `yaml:"recoveries_before_switch"`
 	MinHold                string `yaml:"min_hold"`
 	LinkLossGrace          string `yaml:"link_loss_grace"`
+	StartupAPITimeout      string `yaml:"startup_api_timeout"`
 	CriticalQuorum         int    `yaml:"critical_quorum"`
 }
 
@@ -136,8 +146,9 @@ func LoadBytes(data []byte) (Config, error) {
 
 func normalize(raw rawConfig) (Config, error) {
 	cfg := Config{
-		Mihomo: raw.Mihomo,
-		Groups: raw.Groups,
+		Mihomo:    raw.Mihomo,
+		Groups:    raw.Groups,
+		Providers: raw.Providers,
 		Decision: DecisionConfig{
 			Mode:                   raw.Decision.Mode,
 			FailuresBeforeSwitch:   raw.Decision.FailuresBeforeSwitch,
@@ -158,6 +169,10 @@ func normalize(raw rawConfig) (Config, error) {
 	cfg.Decision.LinkLossGrace, err = durationOrDefault(raw.Decision.LinkLossGrace, 15*time.Second)
 	if err != nil {
 		return Config{}, fieldError("decision.link_loss_grace", err)
+	}
+	cfg.Decision.StartupAPITimeout, err = durationOrDefault(raw.Decision.StartupAPITimeout, 60*time.Second)
+	if err != nil {
+		return Config{}, fieldError("decision.startup_api_timeout", err)
 	}
 	if cfg.Decision.Mode == "" {
 		cfg.Decision.Mode = "auto"
@@ -238,18 +253,17 @@ func validate(cfg Config) error {
 	if err := validateLoopbackURL(cfg.Mihomo.API, "mihomo api", false); err != nil {
 		return err
 	}
-	proxy, err := url.Parse(cfg.Mihomo.Proxy)
-	if err != nil || proxy.Scheme == "" || proxy.Hostname() == "" || (proxy.Scheme != "http" && proxy.Scheme != "https") {
-		return errors.New("mihomo proxy must be an http(s) URL")
+	if err := validateProxyURL(cfg.Mihomo.Proxy); err != nil {
+		return err
 	}
-	if !isLoopbackHost(proxy.Hostname()) || proxy.Port() != "7890" {
-		return errors.New("mihomo proxy must point to loopback port 7890")
-	}
-	if strings.TrimSpace(cfg.Mihomo.SecretFile) == "" {
-		return errors.New("mihomo secret_file is required")
-	}
+	// The command entrypoints provide /guardian/controller_secret by default.
+	// Keep this field optional so the installer can use a separate persistent
+	// secret mount without duplicating its path into generated configuration.
 	if cfg.Groups.Channel == "" || cfg.Groups.Main == "" || cfg.Groups.Backup == "" {
 		return errors.New("mihomo groups channel, main, and backup are required")
+	}
+	if (cfg.Providers.Main == "") != (cfg.Providers.Backup == "") {
+		return errors.New("providers main and backup must be configured together")
 	}
 	if cfg.Decision.Mode != "auto" && cfg.Decision.Mode != "observe" && cfg.Decision.Mode != "force" {
 		return errors.New("decision.mode must be auto, observe, or force")
@@ -296,6 +310,24 @@ func validate(cfg Config) error {
 		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
 			return fmt.Errorf("purity url %q must be an https url", rawURL)
 		}
+	}
+	return nil
+}
+
+func validateProxyURL(raw string) error {
+	proxy, err := url.Parse(raw)
+	if err != nil || proxy.Scheme == "" || proxy.Hostname() == "" {
+		return errors.New("mihomo proxy must be a loopback http(s) or socks5 URL")
+	}
+	if proxy.Scheme != "http" && proxy.Scheme != "https" && proxy.Scheme != "socks5" && proxy.Scheme != "socks5h" {
+		return errors.New("mihomo proxy must be a loopback http(s) or socks5 URL")
+	}
+	if !isLoopbackHost(proxy.Hostname()) {
+		return errors.New("mihomo proxy must point to loopback")
+	}
+	port, err := strconv.Atoi(proxy.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("mihomo proxy must include a valid port")
 	}
 	return nil
 }

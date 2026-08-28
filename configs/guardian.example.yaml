@@ -9,6 +9,11 @@ groups:
   main: MAIN
   backup: BACKUP-USA
 
+# 由安装器从 proxy-groups.<name>.use 自动填充；不要手工写入订阅 URL。
+providers:
+  main: main-channel
+  backup: backup-channel
+
 decision:
   mode: auto
   interval: 15s
@@ -16,6 +21,7 @@ decision:
   recoveries_before_switch: 2
   min_hold: 120s
   link_loss_grace: 15s
+  startup_api_timeout: 60s
   critical_quorum: 2
 
 probes:

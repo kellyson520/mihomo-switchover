@@ -77,6 +77,13 @@ func (e *Engine) Evaluate(current state.State, input Input) Action {
 	if current.ProviderLocks == nil {
 		current.ProviderLocks = make(map[string]state.ProviderLock)
 	}
+	if current.ForcedChannel != "" {
+		if current.ForceUntil.IsZero() || now.Before(current.ForceUntil) {
+			return Action{Kind: Noop, Reason: "manual channel force is active", State: current}
+		}
+		current.ForcedChannel = ""
+		current.ForceUntil = time.Time{}
+	}
 	if current.CurrentChannel == e.cfg.MainChannel {
 		current.RecoveryStreak = 0
 		if input.CurrentHealthy {

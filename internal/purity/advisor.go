@@ -23,6 +23,7 @@ func Assess(lookups []Lookup) Result {
 	}
 	result := Result{Score: 100}
 	first := lookups[0]
+	result.IP = first.IP
 	for _, current := range lookups[1:] {
 		if current.IP != "" && first.IP != "" && current.IP != first.IP {
 			result.Warning = "lookup_conflict"

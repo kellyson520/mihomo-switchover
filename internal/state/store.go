@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -49,20 +50,27 @@ func NewStore(path, defaultChannel string) *Store {
 func (s *Store) Load() (State, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	data, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return Default(s.defaultChannel), nil
-	}
+	var result State
+	err := s.withFileLock(func() error {
+		data, err := os.ReadFile(s.path)
+		if errors.Is(err, os.ErrNotExist) {
+			result = Default(s.defaultChannel)
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(data, &result); err != nil {
+			backup := s.path + ".corrupt." + time.Now().UTC().Format("20060102T150405.000000000Z")
+			if renameErr := os.Rename(s.path, backup); renameErr != nil {
+				return fmt.Errorf("decode state: %w; preserve corrupt state: %v", err, renameErr)
+			}
+			result = Default(s.defaultChannel)
+		}
+		return nil
+	})
 	if err != nil {
 		return State{}, err
-	}
-	var result State
-	if err := json.Unmarshal(data, &result); err != nil {
-		backup := s.path + ".corrupt." + time.Now().UTC().Format("20060102T150405.000000000Z")
-		if renameErr := os.Rename(s.path, backup); renameErr != nil {
-			return State{}, fmt.Errorf("decode state: %w; preserve corrupt state: %v", err, renameErr)
-		}
-		return Default(s.defaultChannel), nil
 	}
 	if result.CurrentChannel == "" {
 		result.CurrentChannel = s.defaultChannel
@@ -87,27 +95,39 @@ func (s *Store) Save(value State) error {
 	if err != nil {
 		return err
 	}
+	return s.withFileLock(func() error {
+		tmp := s.path + ".tmp"
+		file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		if err != nil {
+			return err
+		}
+		if _, err := file.Write(data); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if err := file.Sync(); err != nil {
+			_ = file.Close()
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		return os.Rename(tmp, s.path)
+	})
+}
+
+func (s *Store) withFileLock(fn func() error) error {
 	if err := os.MkdirAll(filepath.Dir(s.path), 0700); err != nil {
 		return err
 	}
-	tmp := s.path + ".tmp"
-	file, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	lock, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}
-	if _, err := file.Write(data); err != nil {
-		_ = file.Close()
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, s.path); err != nil {
-		return err
-	}
-	return nil
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
 }

@@ -83,3 +83,51 @@ func TestClientRejectsNonLoopbackController(t *testing.T) {
 		t.Fatal("expected non-loopback API to be rejected")
 	}
 }
+
+func TestClientListsProxyGroupsWithoutUsingExternalProxy(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/proxies" {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"proxies":{"CHANNEL":{"name":"CHANNEL","type":"Selector","now":"MAIN","all":["MAIN","BACKUP-USA"]}}}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, err := client.ListProxies(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if groups["CHANNEL"].Now != "MAIN" {
+		t.Fatalf("groups=%+v", groups)
+	}
+}
+
+func TestClientReadsProviderNodeHealth(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/providers/proxies/backup-channel" {
+			t.Fatalf("path=%s", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"name":"backup-channel","type":"Proxy","proxies":[{"name":"backup-old","alive":true,"history":[{"time":"2026-08-27T15:16:28.518485852Z","delay":753}]},{"name":"backup-dead","alive":false,"history":[{"time":"2026-08-27T15:16:27.765024872Z","delay":0}]}]}`))
+	}))
+	defer server.Close()
+	client, err := NewClient(server.URL, "secret", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider, err := client.GetProvider(context.Background(), "backup-channel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provider.Name != "backup-channel" || len(provider.Proxies) != 2 {
+		t.Fatalf("provider=%+v", provider)
+	}
+	if !provider.Proxies[0].Alive || provider.Proxies[1].Alive {
+		t.Fatalf("proxy health=%+v", provider.Proxies)
+	}
+	if provider.Proxies[0].History[0].Delay != 753 {
+		t.Fatalf("history=%+v", provider.Proxies[0].History)
+	}
+}

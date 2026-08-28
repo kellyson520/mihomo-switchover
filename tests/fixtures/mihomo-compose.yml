@@ -1,0 +1,19 @@
+services:
+  mihomo-cliproxy:
+    image: metacubex/mihomo:Alpha
+    container_name: mihomo-cliproxy
+    restart: unless-stopped
+    volumes:
+      - ./config/config.yaml:/root/.config/mihomo/config.yaml:ro
+      - ./providers:/root/.config/mihomo/providers
+    ports:
+      - 127.0.0.1:7891:7890
+      - 127.0.0.1:9090:9090
+    networks:
+      1panel-network:
+        aliases:
+          - mihomo-cliproxy
+
+networks:
+  1panel-network:
+    external: true

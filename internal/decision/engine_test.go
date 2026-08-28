@@ -61,3 +61,23 @@ func TestPurityWarningCannotCreateSwitchAction(t *testing.T) {
 		t.Fatalf("purity changed routing: %s", action.Kind)
 	}
 }
+
+func TestForcedChannelBlocksAutomaticSwitchUntilExpiry(t *testing.T) {
+	e := NewEngine(DecisionConfig{FailuresBeforeSwitch: 1, MinHold: 0})
+	now := time.Unix(100, 0)
+	current := state.Default("MAIN")
+	current.CurrentChannel = "BACKUP-USA"
+	current.ForcedChannel = "BACKUP-USA"
+	current.ForceUntil = now.Add(time.Minute)
+	action := e.Evaluate(current, Input{CurrentHealthy: true, BackupHealthy: true, Now: now})
+	if action.Kind != Noop || action.State.CurrentChannel != "BACKUP-USA" {
+		t.Fatalf("forced action=%+v", action)
+	}
+
+	expired := action.State
+	expired.ForceUntil = now.Add(-time.Second)
+	recovered := e.Evaluate(expired, Input{CurrentHealthy: true, BackupHealthy: true, Now: now})
+	if recovered.State.ForcedChannel != "" || recovered.State.ForceUntil != (time.Time{}) {
+		t.Fatalf("force did not expire: %+v", recovered.State)
+	}
+}

@@ -21,10 +21,34 @@ type Client struct {
 }
 
 type Proxy struct {
-	Name string   `json:"name"`
-	Type string   `json:"type"`
-	Now  string   `json:"now"`
-	All  []string `json:"all"`
+	Name         string                 `json:"name"`
+	Type         string                 `json:"type"`
+	Now          string                 `json:"now"`
+	All          []string               `json:"all"`
+	Alive        bool                   `json:"alive"`
+	History      []DelayHistory         `json:"history"`
+	Extra        map[string]ProbeHealth `json:"extra"`
+	ProviderName string                 `json:"provider-name"`
+}
+
+type DelayHistory struct {
+	Time  time.Time `json:"time"`
+	Delay int       `json:"delay"`
+}
+
+type ProbeHealth struct {
+	Alive   bool           `json:"alive"`
+	History []DelayHistory `json:"history"`
+}
+
+type Provider struct {
+	Name           string    `json:"name"`
+	Type           string    `json:"type"`
+	VehicleType    string    `json:"vehicleType"`
+	Proxies        []Proxy   `json:"proxies"`
+	TestURL        string    `json:"testUrl"`
+	ExpectedStatus string    `json:"expectedStatus"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 type apiError struct {
@@ -63,6 +87,35 @@ func (c *Client) Heartbeat(ctx context.Context) error {
 	return nil
 }
 
+func (c *Client) ListProxies(ctx context.Context) (map[string]Proxy, error) {
+	status, body, err := c.do(ctx, http.MethodGet, "/proxies", nil)
+	if err != nil {
+		return nil, err
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return nil, ErrUnauthorized
+	}
+	if status < 200 || status >= 300 {
+		return nil, &apiError{Status: status, Body: trimBody(body)}
+	}
+	var response struct {
+		Proxies map[string]Proxy `json:"proxies"`
+	}
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("decode proxies: %w", err)
+	}
+	if response.Proxies == nil {
+		response.Proxies = make(map[string]Proxy)
+	}
+	for name, proxy := range response.Proxies {
+		if proxy.Name == "" {
+			proxy.Name = name
+			response.Proxies[name] = proxy
+		}
+	}
+	return response.Proxies, nil
+}
+
 func (c *Client) GetProxy(ctx context.Context, name string) (Proxy, error) {
 	status, body, err := c.do(ctx, http.MethodGet, "/proxies/"+url.PathEscape(name), nil)
 	if err != nil {
@@ -79,6 +132,27 @@ func (c *Client) GetProxy(ctx context.Context, name string) (Proxy, error) {
 		return Proxy{}, fmt.Errorf("decode proxy %q: %w", name, err)
 	}
 	return proxy, nil
+}
+
+func (c *Client) GetProvider(ctx context.Context, name string) (Provider, error) {
+	status, body, err := c.do(ctx, http.MethodGet, "/providers/proxies/"+url.PathEscape(name), nil)
+	if err != nil {
+		return Provider{}, err
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return Provider{}, ErrUnauthorized
+	}
+	if status < 200 || status >= 300 {
+		return Provider{}, &apiError{Status: status, Body: trimBody(body)}
+	}
+	var provider Provider
+	if err := json.Unmarshal(body, &provider); err != nil {
+		return Provider{}, fmt.Errorf("decode provider %q: %w", name, err)
+	}
+	if provider.Name == "" {
+		provider.Name = name
+	}
+	return provider, nil
 }
 
 func (c *Client) SetProxy(ctx context.Context, group, node string) error {

@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build and safely inject a persistent, same-container mihomo guardian that routes all external probes through mihomo, keeps provider nodes sticky, switches channels only on corroborated evidence, and terminates together with mihomo when the local control link is lost.
+**Goal:** Build and safely inject a persistent, same-container mihomo guardian that routes all external probes through mihomo, keeps provider nodes sticky, switches channels only on corroborated evidence, and never stops mihomo when guardian fails.
 
-**Architecture:** A statically linked Go binary is mounted into the existing `mihomo-cliproxy` container and becomes PID 1. It starts `/mihomo`, talks to the local controller API directly, sends every external HTTP probe through `127.0.0.1:7890`, persists state/logs under `/opt/mihomo-cliproxy/guardian`, and exits after killing mihomo when the controller API heartbeat is lost beyond the configured grace period. The installer patches the existing compose file transactionally and keeps timestamped rollback copies.
+**Architecture:** A statically linked Go binary and launcher script are mounted into the existing `mihomo-cliproxy` container. The launcher remains PID 1, starts mihomo as the production proxy, and independently restarts guardian when guardian crashes or loses the mihomo API; guardian never stops mihomo. Guardian talks to the local controller API directly, sends every external HTTP probe through `127.0.0.1:7890`, persists state/logs under `/opt/mihomo-cliproxy/guardian`, and exits after a lost heartbeat so the launcher can restart only guardian. The installer patches the existing compose file transactionally and keeps timestamped rollback copies.
 
 **Tech Stack:** Go standard library, `gopkg.in/yaml.v3`, Docker BuildKit builder (`golang:1.24-alpine`), POSIX-compatible shell, Python 3 host-side installer tests, Go `testing` package.
 
@@ -15,16 +15,16 @@
 All paths below are relative to `/上传/mihomo-guardian` unless an absolute deployment path is shown.
 
 - Create `go.mod`, `go.sum`: Go module and locked YAML dependency.
-- Create `cmd/guardian/main.go`: CLI entrypoint and supervisor process.
+- Create `cmd/guardian/main.go`: guardian CLI entrypoint.
 - Create `internal/config/config.go`: YAML schema, defaults, validation, and file reload.
 - Create `internal/mihomo/client.go`: direct local mihomo REST API client and proxy/group models.
-- Create `internal/probe/probe.go`: HTTP-over-mihomo probe client, node delay probes, and status classification.
+- Create `internal/probe/probe.go`: HTTP-over-mihomo probe client and status classification.
 - Create `internal/decision/engine.go`: pure failover, recovery, cooldown, quorum, and sticky-node decision logic.
 - Create `internal/state/store.go`: atomic JSON state and provider lock persistence.
 - Create `internal/purity/advisor.go`: optional proxied IP/ASN/risk advisor; never a single-sample switch trigger.
 - Create `internal/logging/logger.go`: JSONL logging, redaction, and size-based rotation.
 - Create `internal/runtime/runtime.go`: heartbeat loop, reload loop, probe cycle, and decision application.
-- Create `internal/supervisor/supervisor.go`: start/stop/wait for `/mihomo` and enforce lifecycle coupling.
+- Create `deploy/start-guardian.sh`: same-container launcher that keeps mihomo alive while restarting guardian independently.
 - Create `configs/guardian.example.yaml`: one editable behavior configuration with safe defaults.
 - Create `deploy/Dockerfile.builder`: reproducible static binary/test builder; no runtime image replacement.
 - Create `scripts/install.sh`: preflight, build, backup, idempotent compose/config injection, migration, and smoke test.
@@ -175,9 +175,14 @@ Implement `Client` with `GetProxy`, `ListProxies`, `Heartbeat`, `Delay`, `SetPro
 
 Create a dedicated `http.Transport` whose only proxy is the configured mihomo proxy URL. Do not fall back to `http.DefaultTransport`. Classify 200–499 as `reachable_http`, 5xx as `upstream_http_error`, and DNS/TCP/TLS/timeout failures as their specific class. Record status and duration but redact query credentials.
 
-- [ ] **Step 5: Add node delay probe behavior.**
+- [ ] **Step 5: Add provider-backed node verification behavior.**
 
-Call the direct mihomo API `/proxies/{node}/delay` with each configured critical URL. A successful mihomo delay response proves that mihomo sent the request through that node; the controller must not temporarily select the node just to test it.
+For provider-backed groups, read `/providers/proxies/{provider}` and match group candidates by
+node name. Accept a candidate only when mihomo reports `alive: true` and includes health history;
+use the latest recorded delay only as a stable selection score. Do not temporarily select every
+candidate in production traffic. Some mihomo Alpha versions return 404 for
+`/proxies/{node}/delay` even though provider metadata contains per-node health. Keep the direct
+`/proxies/{name}/delay` path for groups without a provider mapping, where the API supports it.
 
 - [ ] **Step 6: Run focused tests, then commit.**
 
@@ -326,53 +331,55 @@ git add internal/purity internal/logging internal/runtime internal/config/config
 git commit -m "feat: add proxied probes and safe runtime loop"
 ```
 
-### Task 5: Implement same-container supervisor and CLI
+### Task 5: Implement the independent guardian launcher and CLI
 
 **Files:**
-- Create: `internal/supervisor/supervisor.go`
+- Create: `deploy/start-guardian.sh`
 - Create: `cmd/guardian/main.go`
-- Test: `internal/supervisor/supervisor_test.go`
 - Test: `cmd/guardian/main_test.go`
+- Test: `tests/test_launcher.py`
 
-- [ ] **Step 1: Write failing lifecycle tests.**
+- [ ] **Step 1: Write failing launcher and CLI tests.**
 
-Test child start, signal forwarding, startup API timeout, child exit propagation, and runtime link-loss termination:
+Test that run arguments keep mihomo defaults and the launcher restarts guardian without signaling mihomo:
 
 ```go
-func TestSupervisorStopsMihomoWhenControllerAPINeverComesUp(t *testing.T) {
-    child := &FakeChild{}
-    s := NewSupervisor(child, SupervisorConfig{StartupAPITimeout: 20 * time.Millisecond})
-    err := s.Run(context.Background(), func(context.Context) error { return ErrMihomoAPIUnavailable })
-    if !errors.Is(err, ErrMihomoAPIUnavailable) { t.Fatalf("err=%v", err) }
-    if !child.Terminated { t.Fatal("mihomo child remained alive") }
+func TestParseRunCommandKeepsMihomoDefaults(t *testing.T) {
+    args, err := parseRunArgs([]string{"run", "--config", "/guardian/guardian.yaml"})
+    if err != nil { t.Fatal(err) }
+    if args.MihomoPath != "/mihomo" || args.MihomoConfigDir != "/root/.config/mihomo" {
+        t.Fatalf("args=%+v", args)
+    }
 }
+```
 
-func TestSupervisorPropagatesMihomoExit(t *testing.T) {
-    child := &FakeChild{Exit: errors.New("mihomo exited")}
-    s := NewSupervisor(child, SupervisorConfig{})
-    err := s.Run(context.Background(), func(context.Context) error { return nil })
-    if err == nil || !strings.Contains(err.Error(), "mihomo exited") { t.Fatalf("err=%v", err) }
-}
+```python
+def test_launcher_restarts_guardian_without_killing_mihomo(tmp_path):
+    script = Path("deploy/start-guardian.sh").read_text()
+    assert "kill \"$mihomo_pid\"" not in script
+    assert "guardian_pid" in script
+    assert "wait \"$mihomo_pid\"" in script
 ```
 
 - [ ] **Step 2: Run the tests and confirm RED.**
 
 ```bash
-docker run --rm -v /上传/mihomo-guardian:/src -w /src golang:1.24-alpine sh -c 'go test ./internal/supervisor ./cmd/guardian -v'
+docker run --rm -v /上传/mihomo-guardian:/src -w /src golang:1.24-alpine sh -c 'go test ./cmd/guardian -v'
+pytest -q tests/test_launcher.py
 ```
 
-Expected: FAIL because the supervisor and CLI do not exist.
+Expected: FAIL because the launcher test and CLI implementation do not exist.
 
-- [ ] **Step 3: Implement the supervisor.**
+- [ ] **Step 3: Implement the independent launcher.**
 
-Start `/mihomo -d /root/.config/mihomo` as a child. Wait for direct authenticated `GET /version` or `GET /proxies` within `startup_api_timeout`. Forward SIGTERM/SIGINT, terminate the child on startup failure or link loss, wait for it, and exit non-zero. No goroutine may continue probes after `ErrMihomoLinkLost`.
+`deploy/start-guardian.sh` starts `/mihomo -d /root/.config/mihomo` in the background, records its PID, then loops `/guardian/bin/guardian run ...` in a separate child loop. Guardian failures are logged and restarted after one second. The guardian loop never signals or waits on mihomo as a prerequisite for restarting guardian. The launcher waits on mihomo; when mihomo exits, it terminates the guardian loop and exits with mihomo's status. SIGTERM/SIGINT are the only paths that intentionally terminate both children.
 
-- [ ] **Step 4: Implement CLI commands.**
+- [ ] **Step 4: Implement the guardian CLI without owning mihomo.**
 
-Support:
+`run` loads the single config, opens the persistent store/log, creates direct local API and mihomo-proxied external clients, and runs the guardian loop. It never starts, stops, or signals `/mihomo`; startup/API loss makes only the guardian process return non-zero so the launcher can restart it. Support:
 
 ```text
-guardian run --config /guardian/guardian.yaml --data /guardian/data --logs /guardian/logs --secret-file /guardian/controller_secret --mihomo /mihomo
+guardian run --config /guardian/guardian.yaml --data /guardian/data --logs /guardian/logs --secret-file /guardian/controller_secret
 guardian status --config ...
 guardian switch main|backup --config ...
 guardian auto --config ...
@@ -380,14 +387,15 @@ guardian probe --config ...
 guardian reload --config ...
 ```
 
-`run` is the only PID 1 command. Manual commands use the direct mihomo API and write an audited event; they never bypass the configured proxy for external checks. Forced switching has an expiry and is persisted.
+Manual commands use the direct mihomo API and write an audited event; they never bypass the configured proxy for external checks. Forced switching has an expiry and is persisted.
 
-- [ ] **Step 5: Run lifecycle tests and commit.**
+- [ ] **Step 5: Run lifecycle and launcher tests and commit.**
 
 ```bash
-docker run --rm -v /上传/mihomo-guardian:/src -w /src golang:1.24-alpine sh -c 'go test ./internal/supervisor ./cmd/guardian -v'
-git add internal/supervisor cmd/guardian
-git commit -m "feat: supervise mihomo in the same container"
+docker run --rm -v /上传/mihomo-guardian:/src -w /src golang:1.24-alpine sh -c 'go test ./cmd/guardian -v'
+pytest -q tests/test_launcher.py
+git add deploy/start-guardian.sh cmd/guardian tests/test_launcher.py
+git commit -m "feat: restart guardian without stopping mihomo"
 ```
 
 ### Task 6: Add the one-file configuration and local build pipeline
@@ -475,7 +483,7 @@ git commit -m "build: add guardian builder and operator docs"
 
 - [ ] **Step 1: Write failing installer patch tests.**
 
-Test that the compose patch is idempotent, preserves ports/networks/providers, adds only persistent mounts, sets guardian as PID 1, and refuses a compose file whose target service is not uniquely found:
+Test that the compose patch is idempotent, preserves ports/networks/providers, adds only persistent mounts, sets the launcher as PID 1, and refuses a compose file whose target service is not uniquely found:
 
 ```python
 def test_patch_is_idempotent_and_preserves_existing_service(tmp_path):
@@ -486,7 +494,7 @@ def test_patch_is_idempotent_and_preserves_existing_service(tmp_path):
     assert "127.0.0.1:7891:7890" in twice
     assert "1panel-network" in twice
     assert "/opt/mihomo-cliproxy/providers:/root/.config/mihomo/providers" in twice
-    assert "entrypoint: [/guardian/bin/guardian]" in twice
+    assert "entrypoint: [\"/bin/sh\", \"/guardian/start-guardian.sh\"]" in twice
     assert "/opt/mihomo-cliproxy/guardian/data:/guardian/data" in twice
 
 def test_patch_refuses_missing_target_service():
@@ -504,7 +512,7 @@ Expected: FAIL because `scripts/compose_patch.py` and its fixture do not exist.
 
 - [ ] **Step 3: Implement an idempotent compose patcher.**
 
-Use Python standard library only. Parse the known compose structure by indentation and exact service name; do not regex-replace arbitrary YAML. Insert or replace only the guardian `entrypoint`, `command`, and five bind mounts. Do not alter existing ports, networks, provider mount, image, or restart policy. Write to a temp file and atomically replace after validating the required strings.
+Use Python standard library only. Parse the known compose structure by indentation and exact service name; do not regex-replace arbitrary YAML. Insert or replace only the launcher `entrypoint`, six persistent bind mounts (launcher, binary, config, data, logs, secret), and its empty command. Do not alter existing ports, networks, provider mount, image, or restart policy. Write to a temp file and atomically replace after validating the required strings.
 
 - [ ] **Step 4: Implement install preflight and transactional backup.**
 
@@ -576,11 +584,11 @@ docker restart mihomo-cliproxy
 scripts/status.sh --read-only
 ```
 
-Verify that after restart the same container has guardian as PID 1, mihomo is its child, state is loaded from the host mount, current channel/node are unchanged unless evidence required otherwise, and external probe logs show the mihomo proxy path.
+Verify that after restart the same container has the launcher as PID 1, mihomo is its child, guardian is an independent child, state is loaded from the host mount, current channel/node are unchanged unless evidence required otherwise, and external probe logs show the mihomo proxy path.
 
 - [ ] **Step 5: Exercise fail-closed behavior in a disposable test mode before live failure simulation.**
 
-Use the runtime fake API integration test to force heartbeat loss. Confirm the guardian sends termination to mihomo and exits; do not deliberately break the live channel while the号池 is active. Confirm no `switch` event occurs after heartbeat loss.
+Use the runtime fake API integration test to force heartbeat loss. Confirm guardian exits after the grace period without sending termination to mihomo and without making a decision after heartbeat loss; do not deliberately break the live channel while the号池 is active.
 
 - [ ] **Step 6: Final verification and commit.**
 
@@ -597,7 +605,7 @@ Only after all outputs are clean, commit any final docs/test adjustments and rep
 ## Plan self-review
 
 - Spec coverage: channel switching, vendor probes through mihomo, sticky provider nodes, advisory purity, logs, hot reload, persistent state, same-container lifecycle, restart survival, rollback, and conservative no-candidate behavior are covered by Tasks 1–8.
-- Strong coupling: Tasks 4, 5, and 8 explicitly test startup API timeout, runtime heartbeat loss, mihomo termination, and no decision after link loss.
+- Dependency direction: Tasks 4, 5, and 8 explicitly test startup/API loss, guardian-only restart, mihomo process continuity, and no decision after link loss.
 - No direct external access: Task 2 tests proxy routing and Task 6 documents the rule; config validation rejects an empty/direct external proxy.
 - No placeholders: all tasks name exact files, commands, expected outcomes, and concrete interfaces/tests; no `TODO`, `TBD`, or unspecified “appropriate handling” steps are used.
 - Type consistency: `Config`, `DecisionConfig`, `State`, `Input`, `Action`, `Client`, `Runtime`, and `Supervisor` are introduced in the tasks before use and share the same names.
