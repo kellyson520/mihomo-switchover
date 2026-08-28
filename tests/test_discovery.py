@@ -526,6 +526,56 @@ groups:
 
 
 @pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
+def test_render_writes_prepared_quality_listeners_without_overwriting_other_quality_fields():
+    discovery = discover_from_texts(COMPOSE, CONFIG, inspect=INSPECT, cwd="/srv/mihomo")
+    template = """mihomo:
+  api: http://127.0.0.1:1
+  proxy: http://127.0.0.1:2
+groups:
+  channel: CHANNEL
+  main: MAIN
+  backup: BACKUP-USA
+providers:
+  main: provider-main
+  backup: provider-backup
+quality:
+  enabled: true
+  targets:
+    - id: primary
+      source_group: MAIN
+      listener: http://127.0.0.1:17990
+      node_filter: "keep-this-filter"
+    - id: reserve
+      source_group: BACKUP-USA
+      node_filter: "keep-this-reserve-filter"
+decision:
+  mode: observe
+"""
+
+    rendered = render_guardian_config(
+        template,
+        discovery,
+        quality_targets=[
+            {
+                "id": "primary",
+                "source_group": "MAIN",
+                "listener": "http://127.0.0.1:18190",
+            },
+            {
+                "id": "reserve",
+                "source_group": "BACKUP-USA",
+                "listener": "http://127.0.0.1:18191",
+            },
+        ],
+    )
+
+    assert "listener: http://127.0.0.1:18190" in rendered
+    assert "listener: http://127.0.0.1:18191" in rendered
+    assert 'node_filter: "keep-this-filter"' in rendered
+    assert 'node_filter: "keep-this-reserve-filter"' in rendered
+
+
+@pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
 def test_load_discovery_reads_paths_and_json_inspect(tmp_path):
     compose_path, config_path, inspect_path = _write_inputs(tmp_path)
 
@@ -708,12 +758,20 @@ def test_quality_port_discovery_fails_closed_without_socket_tables_or_on_user_po
 
 
 @pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
-def test_quality_targets_from_example_config_reads_targets_under_quality_root():
+def test_quality_targets_from_example_config_is_safe_to_use_for_first_install():
     example = Path(__file__).parents[1] / "configs" / "guardian.example.yaml"
 
     targets = quality_targets_from_text(example.read_text(encoding="utf-8"))
 
-    assert [target["id"] for target in targets] == ["primary", "reserve"]
+    assert targets == []
+
+
+@pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
+def test_quality_flow_style_inline_mapping_fails_closed_instead_of_being_skipped():
+    with pytest.raises(ValueError, match="inline|block|flow"):
+        quality_targets_from_text(
+            "quality: {enabled: true, targets: [{id: primary, source_group: MAIN}]}\n"
+        )
 
 
 @pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
@@ -730,3 +788,4 @@ def test_install_contains_read_only_quality_preflight_and_quality_patch_path():
     assert 'docker exec "$CONTAINER" cat /proc/net/tcp6' in script
     assert "preflight=ok (no files, services, or containers changed)" in script
     assert "patched = patch_quality_targets(patched, targets)" in script
+    assert "quality_targets=quality_targets" in script

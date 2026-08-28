@@ -912,12 +912,22 @@ def quality_targets_from_text(text: str) -> list[dict[str, Any]]:
     section = _quality_section_text(text, "quality")
     if section is None:
         return []
-    quality = _mapping(_parse_yaml(section, "guardian quality"), "guardian quality")
+    parsed_section = _parse_yaml(section, "guardian quality")
+    if _quality_section_is_inline(text, "quality"):
+        quality_root = _mapping(parsed_section, "guardian quality")
+        quality = _mapping(quality_root.get("quality"), "guardian quality")
+    else:
+        quality = _mapping(parsed_section, "guardian quality")
     enabled = quality.get("enabled", False)
     if not isinstance(enabled, bool):
         raise ValueError("guardian quality.enabled must be boolean")
     if not enabled:
         return []
+    if _quality_section_is_inline(text, "quality"):
+        raise ValueError(
+            "enabled guardian quality uses an unsupported inline/flow mapping; "
+            "rewrite quality as a block mapping"
+        )
     raw_targets = quality.get("targets", [])
     if not isinstance(raw_targets, list) or not raw_targets:
         raise ValueError("enabled guardian quality requires targets")
@@ -1169,10 +1179,38 @@ def _quality_section_text(text: str, section: str) -> str | None:
     bounds = _section_bounds(lines, section)
     if bounds is None:
         return None
+    raw = lines[bounds[0]].rstrip("\r\n")
+    try:
+        key, value = _split_mapping(_strip_comment(raw), 0)
+    except ValueError as exc:
+        raise ValueError(f"{section} section has an unsupported YAML header") from exc
+    if key != section:
+        raise ValueError(f"unexpected section header {key!r} for {section!r}")
+    inline = value.strip()
+    if inline:
+        # Returning the flow value lets the narrow parser validate it.  Callers
+        # that need to update nested entries explicitly reject this form rather
+        # than silently treating the section body as empty.
+        return f"{section}: {inline}\n"
     # Return the section body, not its top-level key.  The caller for the
     # guardian config expects a mapping/list directly; retaining ``quality:``
     # would make enabled targets look like an empty disabled section.
     return "".join(lines[bounds[0] + 1 : bounds[1]])
+
+
+def _quality_section_is_inline(text: str, section: str) -> bool:
+    lines = text.splitlines(keepends=True)
+    bounds = _section_bounds(lines, section)
+    if bounds is None:
+        return False
+    raw = _strip_comment(lines[bounds[0]].rstrip("\r\n"))
+    try:
+        key, value = _split_mapping(raw, 0)
+    except ValueError as exc:
+        raise ValueError(f"{section} section has an unsupported YAML header") from exc
+    if key != section:
+        raise ValueError(f"unexpected section header {key!r} for {section!r}")
+    return bool(value.strip())
 
 
 def _configured_ports(config: Mapping[str, Any]) -> set[int]:
@@ -1618,6 +1656,23 @@ def _direct_key(line: str, section_indent: int) -> str | None:
     return parsed if isinstance(parsed, str) else None
 
 
+def _list_mapping_key(line: str) -> str | None:
+    """Return the key from an inline ``- key: value`` list item."""
+
+    stripped = line.strip()
+    if not stripped.startswith("-"):
+        return None
+    remainder = stripped[1:].lstrip()
+    if not remainder:
+        return None
+    try:
+        key, _ = _split_mapping(_strip_comment(remainder), 0)
+    except ValueError:
+        return None
+    parsed = _parse_scalar(key, 0)
+    return parsed if isinstance(parsed, str) else None
+
+
 def _provider_value(names: Sequence[str]) -> str:
     if len(names) == 1:
         return names[0]
@@ -1692,7 +1747,138 @@ def _render_section(
     return lines
 
 
-def render_guardian_config(template_text: str, discovery: Discovery) -> str:
+def _line_ending(line: str, fallback: str = "\n") -> str:
+    if line.endswith("\r\n"):
+        return "\r\n"
+    if line.endswith("\n"):
+        return "\n"
+    return fallback
+
+
+def _render_quality_targets(
+    lines: list[str], quality_targets: Sequence[Mapping[str, object]]
+) -> list[str]:
+    """Write discovered listener URLs into the user's block-style targets."""
+
+    prepared: dict[str, str] = {}
+    for index, raw in enumerate(quality_targets):
+        target = _mapping(raw, f"prepared quality target {index}")
+        target_id = _string(target.get("id"), f"prepared quality target {index}.id")
+        listener = _string(
+            target.get("listener"), f"prepared quality target {target_id}.listener"
+        )
+        port = _quality_listener_port(listener, target_id)
+        if target_id in prepared:
+            raise ValueError(f"duplicate prepared quality target {target_id!r}")
+        prepared[target_id] = f"http://127.0.0.1:{port}"
+    if not prepared:
+        return lines
+
+    bounds = _section_bounds(lines, "quality")
+    if bounds is None:
+        raise ValueError("prepared quality targets require a quality section")
+    start, end = bounds
+    if _quality_section_is_inline("".join(lines[start:end]), "quality"):
+        raise ValueError(
+            "prepared quality targets require block-style quality mapping; "
+            "inline/flow mapping cannot be updated safely"
+        )
+
+    target_lines = [
+        index
+        for index in range(start + 1, end)
+        if _direct_key(lines[index], 0) == "targets"
+    ]
+    if len(target_lines) != 1:
+        raise ValueError("quality section must contain exactly one targets mapping")
+    targets_line = target_lines[0]
+    _, targets_value = _split_mapping(_strip_comment(lines[targets_line].strip()), 0)
+    if targets_value.strip():
+        raise ValueError(
+            "quality.targets must use a block list when discovered listeners are written"
+        )
+
+    target_end = end
+    for index in range(targets_line + 1, end):
+        if _direct_key(lines[index], 0) is not None:
+            target_end = index
+            break
+    starts = [
+        index
+        for index in range(targets_line + 1, target_end)
+        if _indent(lines[index]) == 4 and lines[index].lstrip().startswith("-")
+    ]
+    if len(starts) != len(prepared):
+        raise ValueError(
+            "quality.targets changed while preparing listeners; refusing to guess"
+        )
+
+    blocks: list[tuple[int, int, str, int, int | None]] = []
+    seen: set[str] = set()
+    for offset, item_start in enumerate(starts):
+        item_end = starts[offset + 1] if offset + 1 < len(starts) else target_end
+        dedented = "".join(
+            line[4:] if line.startswith("    ") else line
+            for line in lines[item_start:item_end]
+        )
+        parsed = _parse_yaml(dedented, f"guardian quality target {offset}")
+        if not isinstance(parsed, list) or len(parsed) != 1:
+            raise ValueError(
+                f"guardian quality target {offset} must be a single mapping item"
+            )
+        target = _mapping(parsed[0], f"guardian quality target {offset}")
+        target_id = _string(
+            target.get("id"), f"guardian quality target {offset}.id"
+        )
+        if target_id in seen:
+            raise ValueError(f"duplicate guardian quality target {target_id!r}")
+        seen.add(target_id)
+        id_lines = [
+            index
+            for index in range(item_start, item_end)
+            if _direct_key(lines[index], 4) == "id"
+            or (index == item_start and _list_mapping_key(lines[index]) == "id")
+        ]
+        listener_lines = [
+            index
+            for index in range(item_start, item_end)
+            if _direct_key(lines[index], 4) == "listener"
+            or (
+                index == item_start
+                and _list_mapping_key(lines[index]) == "listener"
+            )
+        ]
+        if len(id_lines) != 1 or len(listener_lines) > 1:
+            raise ValueError(
+                f"guardian quality target {target_id!r} has ambiguous id/listener fields"
+            )
+        blocks.append((item_start, item_end, target_id, id_lines[0], listener_lines[0] if listener_lines else None))
+
+    if seen != set(prepared):
+        raise ValueError(
+            "prepared quality targets do not match guardian quality.targets"
+        )
+
+    newline = next(
+        (_line_ending(line) for line in lines if line.endswith(("\n", "\r"))),
+        "\n",
+    )
+    # Work backwards so insertion of a missing listener cannot invalidate the
+    # offsets of an earlier target block.
+    for _, _, target_id, id_line, listener_line in reversed(blocks):
+        rendered = f"      listener: {prepared[target_id]}"
+        if listener_line is not None:
+            lines[listener_line] = rendered + _line_ending(lines[listener_line], newline)
+        else:
+            lines.insert(id_line + 1, rendered + _line_ending(lines[id_line], newline))
+    return lines
+
+
+def render_guardian_config(
+    template_text: str,
+    discovery: Discovery,
+    quality_targets: Sequence[Mapping[str, object]] | None = None,
+) -> str:
     """Render only the infrastructure portions of a guardian config template."""
 
     if not isinstance(discovery, Discovery):
@@ -1727,6 +1913,8 @@ def render_guardian_config(template_text: str, discovery: Discovery) -> str:
             "backup": _provider_value(backup_providers),
         },
     )
+    if quality_targets:
+        lines = _render_quality_targets(lines, quality_targets)
     return "".join(lines)
 
 

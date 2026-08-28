@@ -202,3 +202,101 @@ listeners: []
         "guardian-quality-primary"
     ]
     assert patch_quality_targets(once, targets) == once
+
+
+def test_quality_patch_quotes_yaml_sensitive_names_and_validates_generated_sequences():
+    source = '''proxy-groups:
+  - name: MAIN
+    type: select
+    proxies:
+      - "node: one"
+      - "node # two"
+proxy-providers:
+  "provider: # dangerous":
+    type: http
+listeners:
+  - name: user
+    type: mixed
+    listen: 127.0.0.1
+    port: 18000
+    proxy: DIRECT
+'''
+    targets = [
+        {
+            "id": "provider-target",
+            "source_group": "MAIN",
+            "provider": "provider: # dangerous",
+            "listener": "http://127.0.0.1:17990",
+        },
+        {
+            "id": "static-target",
+            "source_group": "MAIN",
+            "listener": "http://127.0.0.1:17991",
+        },
+    ]
+
+    patched = patch_quality_targets(source, targets)
+    parsed = _parse_yaml(patched, "patched mihomo config")
+    generated = {
+        group["name"]: group
+        for group in parsed["proxy-groups"]
+        if group["name"].startswith("GUARDIAN-QUALITY-")
+    }
+    assert generated["GUARDIAN-QUALITY-provider-target"]["use"] == [
+        "provider: # dangerous"
+    ]
+    assert generated["GUARDIAN-QUALITY-static-target"]["proxies"] == [
+        "node: one",
+        "node # two",
+    ]
+    for group in generated.values():
+        for key in ("use", "proxies"):
+            if key in group:
+                assert all(isinstance(value, str) for value in group[key])
+
+
+def test_quality_patch_rejects_unknown_explicit_provider_but_static_target_without_section_works():
+    source = """proxy-groups:
+  - name: MAIN
+    type: select
+    proxies: [node-1]
+listeners: []
+"""
+    with pytest.raises(ValueError, match="provider|declared|proxy-providers"):
+        patch_quality_targets(
+            source,
+            [
+                {
+                    "id": "provider-target",
+                    "source_group": "MAIN",
+                    "provider": "missing-provider",
+                    "listener": "http://127.0.0.1:17990",
+                }
+            ],
+        )
+
+    patched = patch_quality_targets(
+        source,
+        [
+            {
+                "id": "static-target",
+                "source_group": "MAIN",
+                "listener": "http://127.0.0.1:17990",
+            }
+        ],
+    )
+    assert _parse_yaml(patched, "patched mihomo config")["proxy-groups"][-1][
+        "proxies"
+    ] == ["node-1"]
+
+
+def test_quality_patch_preserves_user_comment_after_owned_block():
+    source = patch_quality_targets(SOURCE, TARGETS)
+    source = source.replace(
+        "      - eu-2\n\nproxy-providers:",
+        "      - eu-2\n# user note after guardian block\n\nproxy-providers:",
+    )
+
+    patched = patch_quality_targets(source, TARGETS)
+
+    assert "# user note after guardian block" in patched

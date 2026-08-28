@@ -58,6 +58,9 @@ def test_quality_target_uses_explicit_provider_instead_of_source_group_provider(
   - name: CHANNEL
     type: select
     proxies: [USER-SOURCE, DIRECT]
+proxy-providers:
+  new-provider:
+    type: http
 listeners:
   - name: user
     type: mixed
@@ -92,6 +95,9 @@ def test_patch_file_preserves_crlf_and_file_mode_when_injecting_quality(tmp_path
   - name: CHANNEL
     type: select
     proxies: [MAIN, DIRECT]
+proxy-providers:
+  main-provider:
+    type: http
 """.replace("\n", "\r\n")
     path.write_bytes(source.encode())
     path.chmod(0o640)

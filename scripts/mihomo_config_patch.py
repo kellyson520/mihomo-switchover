@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import os
+import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
@@ -118,6 +119,22 @@ def patch_quality_targets(
         return text
 
     normalised = _normalise_quality_targets(targets)
+    parsed_config = _parse_yaml(text, "mihomo config")
+    if not isinstance(parsed_config, Mapping):
+        raise ValueError("mihomo config must be a mapping")
+    declared_providers = parsed_config.get("proxy-providers")
+    if declared_providers is not None and not isinstance(declared_providers, Mapping):
+        raise ValueError("mihomo proxy-providers must be a mapping")
+    declared_provider_names = (
+        set(declared_providers) if isinstance(declared_providers, Mapping) else set()
+    )
+    for target in normalised:
+        provider = _optional_string(target.get("provider"))
+        if provider and provider not in declared_provider_names:
+            raise ValueError(
+                f"quality target {target['id']!r} references undeclared provider "
+                f"{provider!r}; add it under top-level proxy-providers"
+            )
     lines = text.splitlines(keepends=True)
     newline = "\r\n" if "\r\n" in text else "\n"
 
@@ -240,7 +257,7 @@ def patch_quality_targets(
                 f"    # mihomo-guardian: generated quality target {target['id']}{newline}"
                 f"    type: select{newline}"
                 f"    use:{newline}"
-                f"      - {provider}{newline}"
+                f"      - {_yaml_scalar(provider)}{newline}"
             )
         else:
             source = source_groups[target["source_group"]]
@@ -257,7 +274,9 @@ def patch_quality_targets(
                 f"    # mihomo-guardian: generated quality target {target['id']}{newline}"
                 f"    type: select{newline}"
                 f"    proxies:{newline}"
-                + "".join(f"      - {proxy}{newline}" for proxy in proxies)
+                + "".join(
+                    f"      - {_yaml_scalar(proxy)}{newline}" for proxy in proxies
+                )
             )
         generated_groups.append(body)
     new_lines = _insert_section_blocks(
@@ -310,7 +329,9 @@ def patch_quality_targets(
             new_lines, listener_bounds, generated_listeners, newline
         )
 
-    return "".join(new_lines)
+    result = "".join(new_lines)
+    _validate_generated_quality_types(result, normalised)
+    return result
 
 
 def _normalise_quality_targets(
@@ -370,6 +391,24 @@ def _string_sequence(value: object, label: str) -> list[str]:
             raise ValueError(f"{label} must contain only non-empty strings")
         result.append(item.strip())
     return result
+
+
+_SAFE_PLAIN_SCALAR_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+
+
+def _yaml_scalar(value: str) -> str:
+    """Render a string as a safe YAML scalar for generated list entries."""
+
+    if not isinstance(value, str):
+        raise ValueError("generated YAML scalar must be a string")
+    lowered = value.lower()
+    if (
+        _SAFE_PLAIN_SCALAR_RE.fullmatch(value)
+        and lowered not in {"null", "true", "false", "yes", "no", "on", "off"}
+        and not value.isdigit()
+    ):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _listener_port(value: object, target_id: str) -> int:
@@ -558,6 +597,14 @@ def _remove_blocks(
     remove: set[int] = set()
     for index in indexes:
         start, end = blocks[index]
+        # A comment/blank line after a generated item may belong to the user,
+        # especially when the item is the last one in a section.  Keep those
+        # lines outside the removal range while deleting the item itself.
+        while end > start:
+            stripped = lines[end - 1].strip()
+            if stripped and not stripped.startswith("#"):
+                break
+            end -= 1
         remove.update(range(start, end))
     return [line for index, line in enumerate(lines) if index not in remove]
 
@@ -608,6 +655,45 @@ def _entry_port(entry: Mapping[str, Any], label: str) -> int:
     if not 1 <= port <= 65535:
         raise ValueError(f"{label}.port is out of range")
     return port
+
+
+def _validate_generated_quality_types(
+    text: str, targets: Sequence[Mapping[str, object]]
+) -> None:
+    """Validate the final parsed quality groups, not only emitted text."""
+
+    parsed = _parse_yaml(text, "patched mihomo config")
+    if not isinstance(parsed, Mapping):
+        raise ValueError("patched mihomo config must be a mapping")
+    groups = parsed.get("proxy-groups")
+    if not isinstance(groups, list):
+        raise ValueError("patched mihomo proxy-groups must be a list")
+    generated_names = {
+        _QUALITY_GROUP_PREFIX + str(target["id"]) for target in targets
+    }
+    generated = {}
+    for index, group in enumerate(groups):
+        if not isinstance(group, Mapping):
+            raise ValueError(f"patched mihomo proxy-groups[{index}] must be a mapping")
+        name = group.get("name")
+        if name in generated_names:
+            generated[name] = group
+        for key in ("use", "proxies"):
+            if key not in group:
+                continue
+            values = group[key]
+            if not isinstance(values, list) or not all(
+                isinstance(value, str) for value in values
+            ):
+                raise ValueError(
+                    f"patched mihomo proxy-groups[{index}].{key} must contain only strings"
+                )
+    for name in generated_names:
+        group = generated.get(name)
+        if group is None:
+            raise ValueError(f"generated quality group {name!r} was not emitted")
+        if not any(key in group for key in ("use", "proxies")):
+            raise ValueError(f"generated quality group {name!r} has no node list")
 
 
 def patch_file(

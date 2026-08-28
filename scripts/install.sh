@@ -292,7 +292,8 @@ install -m 0755 "$REPO_DIR/dist/guardian" "$GUARDIAN_ROOT/bin/guardian"
 install -m 0755 "$REPO_DIR/deploy/start-guardian.sh" "$GUARDIAN_ROOT/start-guardian.sh"
 guardian_template="$REPO_DIR/configs/guardian.example.yaml"
 [ -f "$GUARDIAN_ROOT/guardian.yaml" ] && guardian_template="$GUARDIAN_ROOT/guardian.yaml"
-PYTHONPATH="$REPO_DIR" python3 - "$guardian_template" "$GUARDIAN_ROOT/guardian.yaml" "$COMPOSE_PATH" "$CONFIG_PATH" <<'PY'
+PYTHONPATH="$REPO_DIR" python3 - "$guardian_template" "$GUARDIAN_ROOT/guardian.yaml" "$COMPOSE_PATH" "$CONFIG_PATH" "$QUALITY_TARGETS_FILE" <<'PY'
+import json
 import sys
 from pathlib import Path
 
@@ -300,7 +301,11 @@ from scripts.discover import load_discovery, render_guardian_config
 
 template = Path(sys.argv[1]).read_text(encoding="utf-8")
 discovery = load_discovery(sys.argv[3], sys.argv[4], None)
-Path(sys.argv[2]).write_text(render_guardian_config(template, discovery), encoding="utf-8")
+quality_targets = json.loads(Path(sys.argv[5]).read_text(encoding="utf-8"))
+Path(sys.argv[2]).write_text(
+    render_guardian_config(template, discovery, quality_targets=quality_targets),
+    encoding="utf-8",
+)
 Path(sys.argv[2]).chmod(0o640)
 PY
 

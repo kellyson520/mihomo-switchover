@@ -15,9 +15,11 @@ providers:
   backup: backup-channel
 
 # 质量扫描目标完全由用户定义；安装器只负责为每个目标准备隔离 listener/质量组。
-# source_group、provider 和 node_filter 必须替换为实际 mihomo 名称/正则；以下只是示例。
+# 首次安装默认关闭质量扫描，避免下面的占位符被误注入。复制本文件到
+# guardian/guardian.yaml 后，替换 source_group、provider 和 node_filter 为实际
+# mihomo 名称/正则，再将 enabled 改为 true；listener 可省略，安装器会安全回写。
 quality:
-  enabled: true
+  enabled: false
   full_scan_interval: 720h
   retry_interval: 24h
   order: [primary, reserve]
