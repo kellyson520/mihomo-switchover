@@ -720,8 +720,20 @@ listeners:
         {"id": "old", "source_group": "MAIN", "listener": ""},
         {"id": "new", "source_group": "MAIN", "listener": ""},
     ]
-    tcp = "  sl\n  0: 0100007F:4648 00000000:0000 0A 00000000:00000000 00:00000000 00000000 100 0 1 2\n"
-    tcp6 = "  sl\n  0: 00000000000000000000000000000000:4642 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 100 0 1 2\n"
+    header = (
+        "sl local_address rem_address st tx_queue rx_queue tr tm->when "
+        "retrnsmt uid timeout inode\n"
+    )
+    tcp = header + (
+        "  0: 0100007F:4648 00000000:0000 0A 00000000:00000000 "
+        "00:00000000 00000000 100 0 1 2 ffff8e9f83ebe040\n"
+    )
+    tcp6 = header + (
+        "  0: 00000000000000000000000000000000:4642 "
+        "00000000000000000000000000000000:0000 0A "
+        "00000000:00000000 00:00000000 00000000 100 0 1 2 "
+        "ffff8e9f83ebe040\n"
+    )
 
     discovered = discover_quality_ports(
         config,
@@ -748,12 +760,16 @@ def test_quality_port_discovery_fails_closed_without_socket_tables_or_on_user_po
     with pytest.raises(ValueError, match="socket"):
         discover_quality_ports("proxy-groups:\n  - name: MAIN\n", target, proc_tcp=None, proc_tcp6=None)
 
+    header = (
+        "sl local_address rem_address st tx_queue rx_queue tr tm->when "
+        "retrnsmt uid timeout inode\n"
+    )
     with pytest.raises(ValueError, match="port"):
         discover_quality_ports(
             "mixed-port: 17990\nproxy-groups:\n  - name: MAIN\n",
             [{**target[0], "listener": "http://127.0.0.1:17990"}],
-            proc_tcp="sl\n",
-            proc_tcp6="sl\n",
+            proc_tcp=header,
+            proc_tcp6=header,
         )
 
 
@@ -823,6 +839,46 @@ def test_proc_socket_parser_rejects_truncated_or_misaligned_rows(bad_row):
     )
     with pytest.raises(ValueError, match="socket table|unsupported"):
         read_proc_socket_ports(header + bad_row + "\n", header + valid_tcp6)
+
+
+def test_proc_socket_parser_accepts_real_complete_rows_and_signed_tail_values():
+    header = (
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when "
+        "retrnsmt   uid  timeout inode\n"
+    )
+    tcp = (
+        header
+        + " 24: 0100007F:0016 0100007F:3ED2 01 00000000:00000000 "
+        "02:00000195 00000000     0        0 40950748 2 "
+        "ffff8e9f83ebe040 20 4 21 18 -1\n"
+    )
+    tcp6 = (
+        header
+        + " 25: 00000000000000000000000000000000:1F90 "
+        "00000000000000000000000000000000:0000 0A "
+        "00000000:00000000 00:00000000 00000000 0 0 12345 1 "
+        "ffff8e9f83ebe040 100 0 0 10 0\n"
+    )
+
+    assert read_proc_socket_ports(tcp, tcp6) == {22, 8080}
+
+
+def test_proc_socket_parser_rejects_core_only_ten_field_rows():
+    header = (
+        "sl local_address rem_address st tx_queue rx_queue tr tm->when "
+        "retrnsmt uid timeout inode\n"
+    )
+    tcp_row = (
+        "0: 0100007F:4642 00000000:0000 0A 00000000:00000000 "
+        "00:00000000 00000000 100 0 12345\n"
+    )
+    tcp6_row = (
+        "0: 00000000000000000000000000000000:4642 "
+        "00000000000000000000000000000000:0000 0A "
+        "00000000:00000000 00:00000000 00000000 100 0 12345\n"
+    )
+    with pytest.raises(ValueError, match="socket table|unsupported"):
+        read_proc_socket_ports(header + tcp_row, header + tcp6_row)
 
 
 def test_install_contains_read_only_quality_preflight_and_quality_patch_path():

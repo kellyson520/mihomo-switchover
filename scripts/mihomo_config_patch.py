@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlsplit
 
-from scripts.discover import _parse_yaml
+from scripts.discover import _controller_port, _parse_yaml, _port
 
 
 _GROUP_RE = re.compile(r"^( {2})-\s+name:\s*(.*?)\s*$")
@@ -180,7 +180,7 @@ def patch_quality_targets(
         if source_name.startswith(_QUALITY_GROUP_PREFIX):
             raise ValueError("quality source_group must be a user-owned group")
 
-    configured_ports = _configured_mihomo_ports(text)
+    configured_ports = _configured_mihomo_ports(parsed_config)
     listener_ports: dict[str, int] = {}
     listener_port_names: dict[int, str] = {}
     user_listener_ports: set[int] = set()
@@ -434,24 +434,26 @@ def _listener_port(value: object, target_id: str) -> int:
     return port
 
 
-def _configured_mihomo_ports(text: str) -> set[int]:
+def _configured_mihomo_ports(config: Mapping[str, Any]) -> set[int]:
+    """Return only ports from the parsed mihomo top-level configuration.
+
+    Parsing the complete mapping first prevents nested listener/group fields
+    from being mistaken for top-level daemon ports.  The shared port helpers
+    also keep controller URL and host:port handling identical to discovery.
+    """
+
+    if not isinstance(config, Mapping):
+        raise ValueError("mihomo config must be a mapping")
     ports: set[int] = set()
-    for line in text.splitlines():
-        if not line or line[0].isspace() or line.lstrip().startswith("#"):
+    for key, value in config.items():
+        if not isinstance(key, str):
             continue
-        match = re.match(r"^([A-Za-z0-9_-]+):\s*([^#\s]+)", line)
-        if not match:
-            continue
-        key, value = match.groups()
-        value = value.strip("'\"")
-        if (key == "port" or key.endswith("-port")) and value.isdigit():
-            port = int(value, 10)
-            if port:
+        if key == "port" or key.endswith("-port"):
+            port = _port(value, key)
+            if port is not None:
                 ports.add(port)
         elif key == "external-controller":
-            match_port = re.search(r":([0-9]+)$", value.strip("'\""))
-            if match_port:
-                ports.add(int(match_port.group(1), 10))
+            ports.add(_controller_port(value))
     return ports
 
 

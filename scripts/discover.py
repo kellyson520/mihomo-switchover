@@ -1120,7 +1120,15 @@ def prepare_quality_targets(
 
 
 def read_proc_socket_ports(tcp_text: str, tcp6_text: str) -> set[int]:
-    """Parse Linux TCP socket tables; empty/unavailable input fails closed."""
+    """Parse Linux TCP socket tables; malformed input fails closed.
+
+    Linux emits ten core row values (the slot plus local/remote addresses,
+    state, queue/timer values, uid, timeout, and inode), followed by the
+    reference count and kernel pointer.  Established sockets may also have a
+    variable decimal tail; its final value is commonly ``-1``.  Requiring the
+    reference/pointer pair prevents a core-only truncated row from being used
+    to make a port allocation decision.
+    """
 
     if not isinstance(tcp_text, str) or not tcp_text.strip():
         raise ValueError("tcp socket table is unavailable")
@@ -1128,32 +1136,43 @@ def read_proc_socket_ports(tcp_text: str, tcp6_text: str) -> set[int]:
         raise ValueError("tcp6 socket table is unavailable")
     ports: set[int] = set()
     for table, address_digits in ((tcp_text, 8), (tcp6_text, 32)):
+        header_seen = False
         for line in table.splitlines():
             fields = line.split()
             if not fields:
                 continue
 
             if fields[0].lower() == "sl":
-                if len(fields) == 1:
-                    continue
-                if (
-                    len(fields) >= 3
-                    and fields[1].lower() == "local_address"
-                    and fields[2].lower() in {"rem_address", "remote_address"}
-                ):
-                    continue
-                raise ValueError("tcp socket table has an unsupported header")
-            if fields[0].lower() == "local_address":
-                if len(fields) == 1:
-                    continue
-                if len(fields) >= 2 and fields[1].lower() in {
+                header = [field.lower() for field in fields]
+                expected_header = [
+                    "sl",
+                    "local_address",
                     "rem_address",
-                    "remote_address",
-                }:
-                    continue
-                raise ValueError("tcp socket table has an unsupported header")
+                    "st",
+                    "tx_queue",
+                    "rx_queue",
+                    "tr",
+                    "tm->when",
+                    "retrnsmt",
+                    "uid",
+                    "timeout",
+                    "inode",
+                ]
+                if header not in (
+                    expected_header,
+                    [
+                        *expected_header[:2],
+                        "remote_address",
+                        *expected_header[3:],
+                    ],
+                ):
+                    raise ValueError("tcp socket table has an unsupported header")
+                if header_seen:
+                    raise ValueError("tcp socket table has a duplicate header")
+                header_seen = True
+                continue
 
-            if len(fields) < 10:
+            if not header_seen or len(fields) < 12:
                 raise ValueError("tcp socket table has an unsupported row")
 
             address_pattern = rf"[0-9A-Fa-f]{{{address_digits}}}:([0-9A-Fa-f]{{4}})"
@@ -1172,11 +1191,19 @@ def read_proc_socket_ports(tcp_text: str, tcp6_text: str) -> set[int]:
                 raise ValueError("tcp socket table has an unsupported row")
             if not re.fullmatch(r"[0-9A-Fa-f]{8}", fields[6]):
                 raise ValueError("tcp socket table has an unsupported row")
-            if not all(re.fullmatch(r"[0-9]+", field) for field in fields[7:10]):
+            if not all(re.fullmatch(r"-?[0-9]+", field) for field in fields[7:9]):
                 raise ValueError("tcp socket table has an unsupported row")
-            if not all(re.fullmatch(r"[0-9A-Fa-f]+", field) for field in fields[10:]):
+            if not re.fullmatch(r"[0-9]+", fields[9]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not re.fullmatch(r"-?[0-9]+", fields[10]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not re.fullmatch(r"[0-9A-Fa-f]+", fields[11]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not all(re.fullmatch(r"-?[0-9]+", field) for field in fields[12:]):
                 raise ValueError("tcp socket table has an unsupported row")
             ports.add(int(local_match.group(1), 16))
+        if not header_seen:
+            raise ValueError("tcp socket table has an unsupported header")
     return ports
 
 

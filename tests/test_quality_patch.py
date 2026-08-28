@@ -307,6 +307,35 @@ def test_quality_patch_rejects_top_level_mihomo_port_conflict():
         )
 
 
+@pytest.mark.parametrize(
+    "controller",
+    ["http://127.0.0.1:17990/", "127.0.0.1:17990"],
+)
+def test_quality_patch_rejects_controller_port_in_both_supported_forms(controller):
+    source = f"""external-controller: {controller}
+proxy-groups:
+  - name: MAIN
+    type: select
+    proxies: [DIRECT]
+proxy-providers:
+  main-provider:
+    type: http
+"""
+
+    with pytest.raises(ValueError, match="port"):
+        patch_quality_targets(
+            source,
+            [
+                {
+                    "id": "primary",
+                    "source_group": "MAIN",
+                    "provider": "main-provider",
+                    "listener": "http://127.0.0.1:17990",
+                }
+            ],
+        )
+
+
 def test_quality_patch_preserves_user_comment_after_owned_block():
     source = patch_quality_targets(SOURCE, TARGETS)
     source = source.replace(
