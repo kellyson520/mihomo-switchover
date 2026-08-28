@@ -290,6 +290,23 @@ listeners: []
     ] == ["node-1"]
 
 
+def test_quality_patch_rejects_top_level_mihomo_port_conflict():
+    source = SOURCE.replace("mixed-port: 7890", "port: 17990\nmixed-port: 7890")
+
+    with pytest.raises(ValueError, match="port"):
+        patch_quality_targets(
+            source,
+            [
+                {
+                    "id": "primary",
+                    "source_group": "MAIN",
+                    "provider": "main-provider",
+                    "listener": "http://127.0.0.1:17990",
+                }
+            ],
+        )
+
+
 def test_quality_patch_preserves_user_comment_after_owned_block():
     source = patch_quality_targets(SOURCE, TARGETS)
     source = source.replace(

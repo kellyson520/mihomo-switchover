@@ -950,18 +950,19 @@ def quality_targets_from_text(text: str) -> list[dict[str, Any]]:
         targets.append(copied)
 
     order = quality.get("order")
-    if order is not None:
-        if not isinstance(order, list) or len(order) != len(targets):
-            raise ValueError("quality.order must list every target exactly once")
-        ordered: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for value in order:
-            target_id = _string(value, "quality.order entry")
-            if target_id in seen or target_id not in by_id:
-                raise ValueError("quality.order contains an unknown or duplicate target")
-            seen.add(target_id)
-            ordered.append(by_id[target_id])
-        targets = ordered
+    if order is None:
+        raise ValueError("enabled guardian quality requires quality.order")
+    if not isinstance(order, list) or len(order) != len(targets):
+        raise ValueError("quality.order must list every target exactly once")
+    ordered: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in order:
+        target_id = _string(value, "quality.order entry")
+        if target_id in seen or target_id not in by_id:
+            raise ValueError("quality.order contains an unknown or duplicate target")
+        seen.add(target_id)
+        ordered.append(by_id[target_id])
+    targets = ordered
     return targets
 
 
@@ -1126,38 +1127,56 @@ def read_proc_socket_ports(tcp_text: str, tcp6_text: str) -> set[int]:
     if not isinstance(tcp6_text, str) or not tcp6_text.strip():
         raise ValueError("tcp6 socket table is unavailable")
     ports: set[int] = set()
-    for table in (tcp_text, tcp6_text):
+    for table, address_digits in ((tcp_text, 8), (tcp6_text, 32)):
         for line in table.splitlines():
             fields = line.split()
             if not fields:
                 continue
-            first = fields[0].lower()
-            if first == "sl":
-                if len(fields) == 1 or fields[1].lower() == "local_address":
+
+            if fields[0].lower() == "sl":
+                if len(fields) == 1:
+                    continue
+                if (
+                    len(fields) >= 3
+                    and fields[1].lower() == "local_address"
+                    and fields[2].lower() in {"rem_address", "remote_address"}
+                ):
                     continue
                 raise ValueError("tcp socket table has an unsupported header")
-            if first == "local_address":
-                if len(fields) == 1 or fields[1].lower() == "rem_address":
+            if fields[0].lower() == "local_address":
+                if len(fields) == 1:
+                    continue
+                if len(fields) >= 2 and fields[1].lower() in {
+                    "rem_address",
+                    "remote_address",
+                }:
                     continue
                 raise ValueError("tcp socket table has an unsupported header")
-            if len(fields) < 2:
+
+            if len(fields) < 10:
                 raise ValueError("tcp socket table has an unsupported row")
-            local_field = next(
-                (
-                    field
-                    for field in fields[:3]
-                    if re.fullmatch(r"[0-9A-Fa-f]+:[0-9A-Fa-f]{4}", field)
-                ),
-                None,
-            )
-            match = (
-                re.fullmatch(r"[0-9A-Fa-f]+:([0-9A-Fa-f]{4})", local_field)
-                if local_field is not None
-                else None
-            )
-            if not match:
+
+            address_pattern = rf"[0-9A-Fa-f]{{{address_digits}}}:([0-9A-Fa-f]{{4}})"
+            if not re.fullmatch(r"[0-9]+:", fields[0]):
                 raise ValueError("tcp socket table has an unsupported row")
-            ports.add(int(match.group(1), 16))
+            local_match = re.fullmatch(address_pattern, fields[1])
+            if local_match is None or not re.fullmatch(address_pattern, fields[2]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not re.fullmatch(r"[0-9A-Fa-f]{2}", fields[3]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not re.fullmatch(
+                r"[0-9A-Fa-f]{8}:[0-9A-Fa-f]{8}", fields[4]
+            ):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not re.fullmatch(r"[0-9A-Fa-f]{2}:[0-9A-Fa-f]{8}", fields[5]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not re.fullmatch(r"[0-9A-Fa-f]{8}", fields[6]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not all(re.fullmatch(r"[0-9]+", field) for field in fields[7:10]):
+                raise ValueError("tcp socket table has an unsupported row")
+            if not all(re.fullmatch(r"[0-9A-Fa-f]+", field) for field in fields[10:]):
+                raise ValueError("tcp socket table has an unsupported row")
+            ports.add(int(local_match.group(1), 16))
     return ports
 
 
@@ -1216,7 +1235,7 @@ def _quality_section_is_inline(text: str, section: str) -> bool:
 def _configured_ports(config: Mapping[str, Any]) -> set[int]:
     ports: set[int] = set()
     for key, value in config.items():
-        if key.endswith("-port"):
+        if key == "port" or key.endswith("-port"):
             port = _port(value, key)
             if port is not None:
                 ports.add(port)

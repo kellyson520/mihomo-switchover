@@ -444,7 +444,7 @@ def _configured_mihomo_ports(text: str) -> set[int]:
             continue
         key, value = match.groups()
         value = value.strip("'\"")
-        if key.endswith("-port") and value.isdigit():
+        if (key == "port" or key.endswith("-port")) and value.isdigit():
             port = int(value, 10)
             if port:
                 ports.add(port)

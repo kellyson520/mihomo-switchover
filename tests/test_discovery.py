@@ -720,8 +720,8 @@ listeners:
         {"id": "old", "source_group": "MAIN", "listener": ""},
         {"id": "new", "source_group": "MAIN", "listener": ""},
     ]
-    tcp = "  sl\n  0100007F:4648 00000000:0000 0A 00000000:0000 00:00000000 00000000   100        0 1 2\n"
-    tcp6 = "  sl\n  00000000000000000000000000000000:4642 00000000000000000000000000000000:0000 0A 0\n"
+    tcp = "  sl\n  0: 0100007F:4648 00000000:0000 0A 00000000:00000000 00:00000000 00000000 100 0 1 2\n"
+    tcp6 = "  sl\n  0: 00000000000000000000000000000000:4642 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 100 0 1 2\n"
 
     discovered = discover_quality_ports(
         config,
@@ -757,6 +757,20 @@ def test_quality_port_discovery_fails_closed_without_socket_tables_or_on_user_po
         )
 
 
+def test_quality_port_discovery_rejects_top_level_mihomo_port_conflict():
+    config = """port: 17990
+proxy-groups:
+  - name: MAIN
+    type: select
+    proxies: [DIRECT]
+"""
+    target = [{"id": "one", "source_group": "MAIN", "listener": "http://127.0.0.1:17990"}]
+    header = "  sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+
+    with pytest.raises(ValueError, match="port"):
+        discover_quality_ports(config, target, proc_tcp=header, proc_tcp6=header)
+
+
 @pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
 def test_quality_targets_from_example_config_is_safe_to_use_for_first_install():
     example = Path(__file__).parents[1] / "configs" / "guardian.example.yaml"
@@ -774,10 +788,41 @@ def test_quality_flow_style_inline_mapping_fails_closed_instead_of_being_skipped
         )
 
 
+def test_enabled_quality_requires_explicit_complete_order():
+    with pytest.raises(ValueError, match=r"quality\.order|order"):
+        quality_targets_from_text(
+            """quality:
+  enabled: true
+  targets:
+    - id: primary
+      source_group: MAIN
+"""
+        )
+
+
 @pytest.mark.skipif(_DISCOVERY_MISSING, reason="waiting for discovery implementation")
 def test_proc_socket_parser_rejects_unknown_nonempty_rows():
     with pytest.raises(ValueError, match="socket table|unsupported"):
         read_proc_socket_ports("sl\ngarbage\n", "sl\n")
+
+
+@pytest.mark.parametrize(
+    "bad_row",
+    [
+        "0: 0100007F:4642",
+        "foo 00000000:4642",
+        "0: 0100007F:4642 00000000:0000 0A",
+    ],
+)
+def test_proc_socket_parser_rejects_truncated_or_misaligned_rows(bad_row):
+    header = "sl  local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+    valid_tcp6 = (
+        "  0: 00000000000000000000000000000000:4642 "
+        "00000000000000000000000000000000:0000 0A "
+        "00000000:00000000 00:00000000 00000000 0 0 12345 1\n"
+    )
+    with pytest.raises(ValueError, match="socket table|unsupported"):
+        read_proc_socket_ports(header + bad_row + "\n", header + valid_tcp6)
 
 
 def test_install_contains_read_only_quality_preflight_and_quality_patch_path():
