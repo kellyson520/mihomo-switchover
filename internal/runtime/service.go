@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"mihomo-guardian/internal/config"
@@ -11,6 +12,7 @@ import (
 	"mihomo-guardian/internal/mihomo"
 	"mihomo-guardian/internal/probe"
 	"mihomo-guardian/internal/purity"
+	"mihomo-guardian/internal/quality"
 	"mihomo-guardian/internal/state"
 )
 
@@ -41,13 +43,28 @@ type Service struct {
 	state    state.State
 	loaded   bool
 	engine   *decision.Engine
+	quality  *quality.Store
+	recs     []quality.Recommendation
 }
 
-func NewService(cfg config.Config, api API, external ExternalProbe, store *state.Store, logger *logging.Logger) *Service {
-	return &Service{
+func NewService(cfg config.Config, api API, external ExternalProbe, store *state.Store, logger *logging.Logger, qualityStores ...*quality.Store) *Service {
+	service := &Service{
 		cfg: cfg, api: api, external: external, store: store, logger: logger,
 		engine: newDecisionEngine(cfg),
 	}
+	if len(qualityStores) > 0 {
+		service.quality = qualityStores[0]
+	}
+	return service
+}
+
+func NewServiceWithQualityStore(cfg config.Config, api API, external ExternalProbe, store *state.Store, logger *logging.Logger, qualityStore *quality.Store) *Service {
+	return NewService(cfg, api, external, store, logger, qualityStore)
+}
+
+func (s *Service) SetQualityStore(store *quality.Store) {
+	s.quality = store
+	s.recs = nil
 }
 
 func newDecisionEngine(cfg config.Config) *decision.Engine {
@@ -63,6 +80,7 @@ func newDecisionEngine(cfg config.Config) *decision.Engine {
 func (s *Service) UpdateConfig(cfg config.Config) {
 	s.cfg = cfg
 	s.engine = newDecisionEngine(cfg)
+	s.recs = nil
 }
 
 func (s *Service) RunCycle(ctx context.Context) error {
@@ -71,6 +89,9 @@ func (s *Service) RunCycle(ctx context.Context) error {
 		return fmt.Errorf("load state: %w", err)
 	}
 	s.state, s.loaded = loaded, true
+	if err := s.refreshRecommendations(ctx); err != nil {
+		return err
+	}
 
 	channel, err := s.api.GetProxy(ctx, s.cfg.Groups.Channel)
 	if err != nil {
@@ -201,7 +222,13 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 			candidates = append(candidates, decision.Candidate{Name: node, Healthy: true, Score: -delay, Order: order})
 		}
 	}
-	chosen := decision.ChooseNode(stickyNode, candidates)
+	chosen := ""
+	if qualityNode, ok := s.qualityReplacement(ctx, provider, groupName, stickyNode, providerNodes, nodes); ok {
+		chosen = qualityNode
+	}
+	if chosen == "" {
+		chosen = decision.ChooseNode(stickyNode, candidates)
+	}
 	if chosen == "" {
 		s.log("provider_unverified", map[string]any{"provider": provider, "group": groupName})
 		return "", false
@@ -215,6 +242,197 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 	s.state.ProviderLocks[provider] = state.ProviderLock{Provider: provider, Group: groupName, Node: chosen, LastVerifiedAt: time.Now().UTC()}
 	s.log("node_verified", map[string]any{"provider": provider, "group": groupName, "node": chosen})
 	return chosen, true
+}
+
+type mihomoHeartbeater interface {
+	Heartbeat(context.Context) error
+}
+
+func (s *Service) refreshRecommendations(ctx context.Context) error {
+	if s.quality == nil || !s.cfg.Quality.Enabled {
+		s.recs = nil
+		return nil
+	}
+	heartbeater, ok := s.api.(mihomoHeartbeater)
+	if !ok {
+		return fmt.Errorf("%w: runtime API does not expose heartbeat", quality.ErrQualityLink)
+	}
+	if err := heartbeater.Heartbeat(ctx); err != nil {
+		return fmt.Errorf("%w: %v", quality.ErrQualityLink, err)
+	}
+	maxAge := s.cfg.Quality.FullScanInterval
+	if maxAge <= 0 {
+		maxAge = 720 * time.Hour
+	}
+	recommendations, err := quality.ReadRecommendations(s.quality, time.Now().UTC(), maxAge)
+	if err != nil {
+		// A recommendation is advisory state. If its file is unreadable, keep
+		// the already loaded sticky/provider behavior and do not interrupt the
+		// production loop.
+		s.recs = nil
+		s.log("quality_recommendations_ignored", map[string]any{"reason": err.Error()})
+		return nil
+	}
+	s.recs = recommendations
+	return nil
+}
+
+func (s *Service) qualityTarget(provider, groupName string) (config.QualityTarget, bool) {
+	if !s.cfg.Quality.Enabled || (groupName != s.cfg.Groups.Main && groupName != s.cfg.Groups.Backup) {
+		return config.QualityTarget{}, false
+	}
+	expectedProvider := s.providerName(provider)
+	for _, target := range s.cfg.Quality.Targets {
+		if target.SourceGroup != groupName {
+			continue
+		}
+		if expectedProvider != "" && target.Provider != expectedProvider {
+			continue
+		}
+		return target, true
+	}
+	return config.QualityTarget{}, false
+}
+
+func (s *Service) qualityReplacement(ctx context.Context, provider, groupName, stickyNode string, providerNodes map[string]mihomo.Proxy, sourceNodes []string) (string, bool) {
+	if len(s.recs) == 0 || providerNodes == nil {
+		return "", false
+	}
+	target, ok := s.qualityTarget(provider, groupName)
+	if !ok {
+		return "", false
+	}
+	now := time.Now().UTC()
+	maxAge := s.cfg.Quality.FullScanInterval
+	if maxAge <= 0 {
+		maxAge = 720 * time.Hour
+	}
+	thresholds := s.cfg.Quality.Thresholds
+	if thresholds.BaselineDropPoints <= 0 {
+		thresholds.BaselineDropPoints = 20
+	}
+	if thresholds.MinimumConfidence <= 0 {
+		thresholds.MinimumConfidence = 70
+	}
+	if thresholds.CandidateMinimumScore <= 0 {
+		thresholds.CandidateMinimumScore = 60
+	}
+
+	allowed := make(map[string]struct{}, len(sourceNodes))
+	for _, node := range sourceNodes {
+		allowed[node] = struct{}{}
+	}
+	var candidates []quality.Recommendation
+	var sticky *quality.Recommendation
+	for _, recommendation := range s.recs {
+		if recommendation.Target != target.ID || recommendation.SourceGroup != groupName || recommendation.Provider != target.Provider {
+			continue
+		}
+		if _, exists := allowed[recommendation.Node]; !exists {
+			continue
+		}
+		metadata, exists := providerNodes[recommendation.Node]
+		if !exists {
+			continue
+		}
+		validation := quality.RecommendationValidation{
+			Target: target, CurrentNode: recommendation.Node, CurrentIP: recommendation.Identity.IP,
+			CurrentProvider: target.Provider, ProviderAlive: metadata.Alive,
+			ProviderHistoryFresh:    s.qualityHistoryFresh(metadata.History, now),
+			VendorConnectivityFresh: recommendation.Connected,
+			Now:                     now, MaxAge: maxAge, MinimumScore: thresholds.CandidateMinimumScore,
+			MinimumConfidence: thresholds.MinimumConfidence,
+		}
+		if recommendation.Node == stickyNode {
+			if err := quality.ValidateStickyRecommendation(recommendation, validation, thresholds.MinimumConfidence); err != nil {
+				s.log("quality_recommendation_rejected", map[string]any{"target": target.ID, "node": recommendation.Node, "reason": err.Error()})
+				continue
+			}
+			if sticky == nil || recommendation.ReportedAt.After(sticky.ReportedAt) {
+				value := recommendation
+				sticky = &value
+			}
+			continue
+		}
+		if err := quality.ValidateRecommendation(recommendation, validation); err != nil {
+			s.log("quality_recommendation_rejected", map[string]any{"target": target.ID, "node": recommendation.Node, "reason": err.Error()})
+			continue
+		}
+		candidates = append(candidates, recommendation)
+	}
+	if len(candidates) == 0 || sticky == nil {
+		return "", false
+	}
+	// ReadRecommendations is deterministic, but sort again after filtering so
+	// this method remains deterministic if callers inject recommendations.
+	sortQualityRecommendations(candidates)
+	for index := range candidates {
+		candidate := candidates[index]
+		if candidate.Node == sticky.Node {
+			continue
+		}
+		stickyMetadata, exists := providerNodes[sticky.Node]
+		if !exists {
+			continue
+		}
+		request := quality.ReplacementRequest{
+			Sticky: *sticky, Candidate: candidate,
+			StickyValidation: quality.RecommendationValidation{
+				Target: target, CurrentNode: sticky.Node, CurrentIP: sticky.Identity.IP,
+				CurrentProvider: target.Provider, ProviderAlive: stickyMetadata.Alive,
+				ProviderHistoryFresh:    s.qualityHistoryFresh(stickyMetadata.History, now),
+				VendorConnectivityFresh: sticky.Connected,
+				Now:                     now, MaxAge: maxAge, MinimumConfidence: thresholds.MinimumConfidence,
+			},
+			CandidateValidation: quality.RecommendationValidation{
+				Target: target, CurrentNode: candidate.Node, CurrentIP: candidate.Identity.IP,
+				CurrentProvider: target.Provider, ProviderAlive: true,
+				ProviderHistoryFresh: true, VendorConnectivityFresh: true,
+				Now: now, MaxAge: maxAge, MinimumScore: thresholds.CandidateMinimumScore,
+				MinimumConfidence: thresholds.MinimumConfidence,
+			},
+			Thresholds: thresholds,
+		}
+		if replace, reason := quality.EvaluateReplacement(request); replace {
+			s.log("quality_recommendation_accepted", map[string]any{"target": target.ID, "node": candidate.Node, "reason": reason})
+			return candidate.Node, true
+		} else {
+			s.log("quality_recommendation_rejected", map[string]any{"target": target.ID, "node": candidate.Node, "reason": reason})
+		}
+	}
+	return "", false
+}
+
+func sortQualityRecommendations(items []quality.Recommendation) {
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].EffectiveScore != items[j].EffectiveScore {
+			return items[i].EffectiveScore > items[j].EffectiveScore
+		}
+		if !items[i].ReportedAt.Equal(items[j].ReportedAt) {
+			return items[i].ReportedAt.After(items[j].ReportedAt)
+		}
+		return items[i].Node < items[j].Node
+	})
+}
+
+func (s *Service) qualityHistoryFresh(history []mihomo.DelayHistory, now time.Time) bool {
+	if len(history) == 0 {
+		return false
+	}
+	latest := history[0]
+	for _, item := range history[1:] {
+		if item.Time.After(latest.Time) {
+			latest = item
+		}
+	}
+	if latest.Time.IsZero() || latest.Time.After(now.Add(2*time.Minute)) {
+		return false
+	}
+	staleAfter := s.cfg.Quality.Stability.StaleAfter
+	if staleAfter <= 0 {
+		staleAfter = 26 * time.Hour
+	}
+	return !latest.Time.Before(now.Add(-staleAfter))
 }
 
 func (s *Service) providerName(provider string) string {
