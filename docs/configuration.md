@@ -192,6 +192,18 @@ GET /providers/proxies/<provider>
 和号池风控风险。若没有 provider 配置，guardian 才使用 mihomo 的节点 delay API
 验证候选；该检查不会把候选临时切入生产流量。
 
+当 provider 已配置但候选暂时未验证时，guardian 会调用 mihomo 的：
+
+```text
+GET /providers/proxies/<provider>/healthcheck
+```
+
+请求 mihomo 立即刷新原生健康证据。该检查异步执行，不选择节点、不写入 `CHANNEL`，
+并按 `decision.probe_interval` 限频（生产默认 5 分钟），避免备用运行期间主渠道长期
+停留在旧的 `alive: false`，也避免对厂商健康地址产生高频请求。请求失败仍保持
+fail-closed，并写入 `provider_healthcheck_failed`；成功发起后写入
+`provider_healthcheck_requested`，等待后续周期读取新的 `alive` 和 `history`。
+
 ### `quality`
 
 这是可选的质量扫描契约。旧部署可以省略整个 `quality` 段，或明确设置
@@ -267,9 +279,10 @@ IP 身份一致和最低置信度。阈值、保留期和 target 顺序可热重
 | `startup_api_timeout` | `60s` | guardian 启动时等待 mihomo API 的最长时间。改动需要重启 guardian。 |
 | `critical_quorum` | `2` | 至少多少个启用的 critical 探测成功才算渠道健康，不能大于 critical 探测数。 |
 
-主循环每 15 秒运行，但公网厂商探测默认每 5 分钟才刷新一次；缓存期间不会把同一次
-失败重复计入连续失败次数。只有 3 次新的关键探测失败、恢复阈值、最短保持时间和候选
-节点健康条件同时满足时才切换。纯净度评分不参与这个决策。
+主循环每 15 秒运行，但公网厂商探测默认每 5 分钟才刷新一次；未验证 provider 的原生
+healthcheck 也按该周期限频。缓存期间不会把同一次失败重复计入连续失败次数。只有 3
+次新的关键探测失败、恢复阈值、最短保持时间和候选节点健康条件同时满足时才切换。纯净
+度评分不参与这个决策。
 
 ### `probes`
 
@@ -346,6 +359,7 @@ docker exec mihomo-cliproxy /guardian/bin/guardian quality run \
 频率，可热重载。
 
 常用事件包括 `probe`、`purity_advisory`、`node_verified`、`provider_unverified`、
+`provider_healthcheck_requested`、`provider_healthcheck_failed`、
 `switch_observed`、`channel_switched`、`quality_stability_node_complete`、
 `quality_stability_identity_missing`、`quality_stability_summary_failed`、
 `config_reloaded` 和 `config_reload_failed`。日志中不应出现 secret 或 API key。

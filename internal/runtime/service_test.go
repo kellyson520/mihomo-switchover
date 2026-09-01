@@ -15,12 +15,14 @@ import (
 )
 
 type fakeAPI struct {
-	groups       map[string]mihomo.Proxy
-	providers    map[string]mihomo.Provider
-	delays       map[string]error
-	heartbeatErr error
-	delayCalls   []string
-	setCalls     []struct{ group, node string }
+	groups             map[string]mihomo.Proxy
+	providers          map[string]mihomo.Provider
+	delays             map[string]error
+	heartbeatErr       error
+	delayCalls         []string
+	healthCheckCalls   []string
+	healthCheckUpdates map[string]mihomo.Provider
+	setCalls           []struct{ group, node string }
 }
 
 func (f *fakeAPI) Heartbeat(context.Context) error { return f.heartbeatErr }
@@ -35,6 +37,14 @@ func (f *fakeAPI) GetProvider(_ context.Context, name string) (mihomo.Provider, 
 		return mihomo.Provider{}, errors.New("provider not found")
 	}
 	return provider, nil
+}
+
+func (f *fakeAPI) HealthCheckProvider(_ context.Context, name string) error {
+	f.healthCheckCalls = append(f.healthCheckCalls, name)
+	if provider, ok := f.healthCheckUpdates[name]; ok {
+		f.providers[name] = provider
+	}
+	return nil
 }
 
 func (f *fakeAPI) SetProxy(_ context.Context, group, node string) error {
@@ -102,6 +112,65 @@ func TestServiceDoesNotTreatProviderWithoutHealthHistoryAsVerified(t *testing.T)
 	}
 	if len(api.delayCalls) != 0 {
 		t.Fatalf("provider metadata failure fell back to direct node delay: %v", api.delayCalls)
+	}
+}
+
+func TestServiceTriggersNativeProviderHealthCheckForUnverifiedProvider(t *testing.T) {
+	api := &fakeAPI{
+		groups: map[string]mihomo.Proxy{
+			"MAIN": {Name: "MAIN", Now: "main-current", All: []string{"main-current"}},
+		},
+		providers: map[string]mihomo.Provider{
+			"main-provider": {Name: "main-provider", Proxies: []mihomo.Proxy{{Name: "main-current", Alive: false, History: []mihomo.DelayHistory{{Delay: 0}}}}},
+		},
+	}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{Main: "main-provider"}
+	cfg.Decision.ProbeInterval = time.Hour
+	service := NewService(cfg, api, fakeExternal{healthy: false}, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil)
+
+	if _, healthy := service.ensureProvider(context.Background(), "main", cfg.Groups.Main, api.groups[cfg.Groups.Main]); healthy {
+		t.Fatal("unhealthy provider was accepted")
+	}
+	if _, healthy := service.ensureProvider(context.Background(), "main", cfg.Groups.Main, api.groups[cfg.Groups.Main]); healthy {
+		t.Fatal("unhealthy provider was accepted on retry")
+	}
+	if len(api.healthCheckCalls) != 1 || api.healthCheckCalls[0] != "main-provider" {
+		t.Fatalf("health check calls=%v, want one rate-limited native check", api.healthCheckCalls)
+	}
+}
+
+func TestServiceReturnsToMainAfterNativeProviderHealthCheckRecoversIt(t *testing.T) {
+	api := &fakeAPI{
+		groups: map[string]mihomo.Proxy{
+			"CHANNEL":    {Name: "CHANNEL", Now: "BACKUP-USA", All: []string{"MAIN", "BACKUP-USA"}},
+			"MAIN":       {Name: "MAIN", Now: "main-current", All: []string{"main-current"}},
+			"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup-current", All: []string{"backup-current"}},
+		},
+		providers: map[string]mihomo.Provider{
+			"main-provider":   {Name: "main-provider", Proxies: []mihomo.Proxy{{Name: "main-current", Alive: false, History: []mihomo.DelayHistory{{Delay: 0}}}}},
+			"backup-provider": {Name: "backup-provider", Proxies: []mihomo.Proxy{{Name: "backup-current", Alive: true, History: []mihomo.DelayHistory{{Delay: 100}}}}},
+		},
+		healthCheckUpdates: map[string]mihomo.Provider{
+			"main-provider": {Name: "main-provider", Proxies: []mihomo.Proxy{{Name: "main-current", Alive: true, History: []mihomo.DelayHistory{{Delay: 120}}}}},
+		},
+	}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{Main: "main-provider", Backup: "backup-provider"}
+	cfg.Decision.RecoveriesBeforeSwitch = 2
+	cfg.Decision.ProbeInterval = time.Hour
+	service := NewService(cfg, api, fakeExternal{healthy: true}, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil)
+
+	for cycle := 0; cycle < 3; cycle++ {
+		if err := service.RunCycle(context.Background()); err != nil {
+			t.Fatalf("cycle %d: %v", cycle+1, err)
+		}
+	}
+	if api.groups["CHANNEL"].Now != "MAIN" {
+		t.Fatalf("channel=%q, want MAIN after native recovery check", api.groups["CHANNEL"].Now)
+	}
+	if len(api.healthCheckCalls) != 1 || api.healthCheckCalls[0] != "main-provider" {
+		t.Fatalf("health check calls=%v, want one main-provider check", api.healthCheckCalls)
 	}
 }
 

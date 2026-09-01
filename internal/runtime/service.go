@@ -26,6 +26,10 @@ type ProviderAPI interface {
 	GetProvider(context.Context, string) (mihomo.Provider, error)
 }
 
+type ProviderHealthChecker interface {
+	HealthCheckProvider(context.Context, string) error
+}
+
 type ExternalProbe interface {
 	Check(context.Context, config.ProbeSpec) probe.Result
 }
@@ -35,18 +39,19 @@ type ExternalFetcher interface {
 }
 
 type Service struct {
-	cfg      config.Config
-	api      API
-	external ExternalProbe
-	store    *state.Store
-	logger   *logging.Logger
-	state    state.State
-	loaded   bool
-	engine   *decision.Engine
-	quality  *quality.Store
-	recs     []quality.Recommendation
-	probe    cachedProbeResult
-	purity   cachedPurityResult
+	cfg                  config.Config
+	api                  API
+	external             ExternalProbe
+	store                *state.Store
+	logger               *logging.Logger
+	state                state.State
+	loaded               bool
+	engine               *decision.Engine
+	quality              *quality.Store
+	recs                 []quality.Recommendation
+	probe                cachedProbeResult
+	purity               cachedPurityResult
+	providerHealthChecks map[string]time.Time
 }
 
 type cachedProbeResult struct {
@@ -64,7 +69,7 @@ type cachedPurityResult struct {
 func NewService(cfg config.Config, api API, external ExternalProbe, store *state.Store, logger *logging.Logger, qualityStores ...*quality.Store) *Service {
 	service := &Service{
 		cfg: cfg, api: api, external: external, store: store, logger: logger,
-		engine: newDecisionEngine(cfg),
+		engine: newDecisionEngine(cfg), providerHealthChecks: make(map[string]time.Time),
 	}
 	if len(qualityStores) > 0 {
 		service.quality = qualityStores[0]
@@ -98,6 +103,7 @@ func (s *Service) UpdateConfig(cfg config.Config) {
 	// A changed probe/purity configuration must receive fresh public evidence.
 	s.probe = cachedProbeResult{}
 	s.purity = cachedPurityResult{}
+	s.providerHealthChecks = make(map[string]time.Time)
 }
 
 func (s *Service) RunCycle(ctx context.Context) error {
@@ -280,6 +286,7 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 	}
 	providerNodes, providerAvailable := s.providerNodes(ctx, provider)
 	if s.providerName(provider) != "" && !providerAvailable {
+		s.requestProviderHealthCheck(ctx, provider)
 		return "", false
 	}
 	candidates := make([]decision.Candidate, 0, len(nodes))
@@ -297,6 +304,7 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 		chosen = decision.ChooseNode(stickyNode, candidates)
 	}
 	if chosen == "" {
+		s.requestProviderHealthCheck(ctx, provider)
 		s.log("provider_unverified", map[string]any{"provider": provider, "group": groupName})
 		return "", false
 	}
@@ -538,6 +546,32 @@ func (s *Service) providerNodes(ctx context.Context, provider string) (map[strin
 		}
 	}
 	return result, true
+}
+
+func (s *Service) requestProviderHealthCheck(ctx context.Context, provider string) {
+	providerName := s.providerName(provider)
+	if providerName == "" {
+		return
+	}
+	checker, ok := s.api.(ProviderHealthChecker)
+	if !ok {
+		return
+	}
+	if s.providerHealthChecks == nil {
+		s.providerHealthChecks = make(map[string]time.Time)
+	}
+	now := time.Now().UTC()
+	if last, exists := s.providerHealthChecks[provider]; exists && now.Sub(last) < s.externalProbeInterval() {
+		return
+	}
+	// Mark before the request so an API error cannot turn a 15-second guardian
+	// loop into a provider health-check storm. The next interval retries it.
+	s.providerHealthChecks[provider] = now
+	if err := checker.HealthCheckProvider(ctx, providerName); err != nil {
+		s.log("provider_healthcheck_failed", map[string]any{"provider": provider, "name": providerName, "error": err.Error()})
+		return
+	}
+	s.log("provider_healthcheck_requested", map[string]any{"provider": provider, "name": providerName})
 }
 
 func (s *Service) nodeHealthy(ctx context.Context, node string, providerNodes map[string]mihomo.Proxy) (bool, int) {

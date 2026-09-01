@@ -82,7 +82,11 @@ OpenAI、Gemini 等公网厂商以及纯净度查询的最短刷新间隔，默�
 
 生产建议保持 `probe_interval: 5m` 或更长，并通过 mihomo provider 的 `alive` 和
 history 判断节点候选；不要把 `decision.interval` 改成 5 分钟来代替它，否则会同时拖慢
-主备决策循环。修改后按上面的 `reload` 流程校验，先在 `observe` 模式观察日志。
+主备决策循环。provider 候选未验证时，guardian 会通过 mihomo loopback API 请求该
+provider 的原生 `/healthcheck`，按同一 `probe_interval` 限频；这是异步健康检查，不
+选择 `CHANNEL`，不会让备用流量短暂经过主渠道。请求失败继续 fail-closed。日志会出现
+`provider_healthcheck_requested` 或 `provider_healthcheck_failed`。修改后按上面的
+`reload` 流程校验，先在 `observe` 模式观察日志。
 
 ### Quality 目标配置
 

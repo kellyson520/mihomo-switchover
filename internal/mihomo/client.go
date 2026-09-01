@@ -155,6 +155,23 @@ func (c *Client) GetProvider(ctx context.Context, name string) (Provider, error)
 	return provider, nil
 }
 
+// HealthCheckProvider asks mihomo to immediately refresh the provider's
+// native health evidence. The check is asynchronous and does not select a
+// channel or change any proxy group.
+func (c *Client) HealthCheckProvider(ctx context.Context, name string) error {
+	status, body, err := c.do(ctx, http.MethodGet, "/providers/proxies/"+url.PathEscape(name)+"/healthcheck", nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusUnauthorized || status == http.StatusForbidden {
+		return ErrUnauthorized
+	}
+	if status < 200 || status >= 300 {
+		return &apiError{Status: status, Body: trimBody(body)}
+	}
+	return nil
+}
+
 func (c *Client) SetProxy(ctx context.Context, group, node string) error {
 	body, err := json.Marshal(map[string]string{"name": node})
 	if err != nil {

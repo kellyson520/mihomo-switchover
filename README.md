@@ -57,7 +57,9 @@ sudo ./scripts/install.sh
 达到阈值且备用节点经过 mihomo provider 健康结果验证才切换；每个供应商的上次成功
 节点落盘并优先复用，不因一次低延迟结果随机换节点。对 provider 节点不做临时切入
 生产流量的 `/proxies/<节点>/delay` 调用，因为当前 mihomo Alpha 对这类路径返回 404；
-没有 `alive` 和健康历史的候选保持未知并拒绝切换。
+没有 `alive` 和健康历史的候选保持未知并拒绝切换。未验证 provider 时，guardian 会
+按 `probe_interval` 请求 mihomo 原生 `/providers/proxies/<provider>/healthcheck`，
+让备用运行期间的主渠道健康证据能够恢复；该请求不切换 `CHANNEL`。
 
 主循环默认每 15 秒运行，但 OpenAI、Gemini 等公网厂商探测默认每 5 分钟刷新一次；
 缓存期间不会重复访问厂商，也不会重复累计同一个失败。修改 `decision.probe_interval`

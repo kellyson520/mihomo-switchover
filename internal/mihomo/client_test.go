@@ -131,3 +131,24 @@ func TestClientReadsProviderNodeHealth(t *testing.T) {
 		t.Fatalf("history=%+v", provider.Proxies[0].History)
 	}
 }
+
+func TestClientTriggersProviderHealthCheck(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/providers/proxies/main-channel/healthcheck" {
+			t.Fatalf("method=%s path=%s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer secret" {
+			t.Fatalf("authorization=%q", r.Header.Get("Authorization"))
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "secret", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.HealthCheckProvider(context.Background(), "main-channel"); err != nil {
+		t.Fatal(err)
+	}
+}
