@@ -70,6 +70,15 @@ def test_install_smoke_supports_socks_only_discovery():
     assert 'case "$proxy_scheme"' in script
 
 
+def test_build_steps_do_not_hardcode_a_mihomo_proxy_port():
+    makefile = (Path(__file__).parents[1] / "Makefile").read_text()
+    installer = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    assert "HTTPS_PROXY=http://127.0.0.1:7890" not in makefile
+    assert "HTTP_PROXY=http://127.0.0.1:7890" not in makefile
+    assert "HTTPS_PROXY=http://127.0.0.1:7890" not in installer
+    assert "HTTP_PROXY=http://127.0.0.1:7890" not in installer
+
+
 def test_install_does_not_swallow_rollback_failure_or_write_repo_temp_files():
     script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
     rollback_calls = [line for line in script.splitlines() if "scripts/rollback.sh" in line]

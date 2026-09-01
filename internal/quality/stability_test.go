@@ -34,8 +34,8 @@ func TestAggregateStabilityUsesFreshHistoryAndComputesPercentiles(t *testing.T) 
 	}
 
 	got := AggregateStability([]mihomo.Proxy{proxy}, "node-a", now, stabilityTestConfig())
-	if !got.Known || !got.Fresh || got.Samples != 4 || got.AliveSamples != 3 {
-		t.Fatalf("snapshot=%+v, want fresh four-sample history with one failed sample", got)
+	if got.Known || !got.Fresh || got.Samples != 4 || got.AliveSamples != 3 {
+		t.Fatalf("snapshot=%+v, want fresh but low-coverage history to remain unknown", got)
 	}
 	if got.P50MS != 200 || got.P95MS != 300 || got.MaxMS != 300 || got.JitterMS != 100 {
 		t.Fatalf("percentiles=%+v, want p50=200 p95=300 max=300 jitter=100", got)
@@ -43,8 +43,8 @@ func TestAggregateStabilityUsesFreshHistoryAndComputesPercentiles(t *testing.T) 
 	if got.CoveragePercent != 1 || got.AvailabilityPercent != 75 {
 		t.Fatalf("coverage/availability=%d/%d, want 1/75", got.CoveragePercent, got.AvailabilityPercent)
 	}
-	if got.StabilityScore <= 0 || got.StabilityScore > 100 {
-		t.Fatalf("stability score=%d, want clamped positive score", got.StabilityScore)
+	if got.StabilityScore != 0 {
+		t.Fatalf("stability score=%d, low coverage must not receive a score", got.StabilityScore)
 	}
 }
 

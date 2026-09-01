@@ -10,7 +10,7 @@ import (
 func TestDecisionSwitchesOnlyAfterThreeCorroboratedFailures(t *testing.T) {
 	e := NewEngine(DecisionConfig{FailuresBeforeSwitch: 3, RecoveriesBeforeSwitch: 2, MinHold: 0})
 	current := state.Default("MAIN")
-	input := Input{CurrentHealthy: false, BackupHealthy: true, BackupNode: "backup-1", Now: time.Unix(100, 0)}
+	input := Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, BackupNode: "backup-1", Now: time.Unix(100, 0)}
 	for i := 1; i <= 2; i++ {
 		action := e.Evaluate(current, input)
 		if action.Kind != Noop {
@@ -31,9 +31,35 @@ func TestStickyNodeWinsOverFasterAlternative(t *testing.T) {
 	}
 }
 
+func TestDecisionDoesNotCountCachedHealthAsANewFailure(t *testing.T) {
+	e := NewEngine(DecisionConfig{FailuresBeforeSwitch: 3, RecoveriesBeforeSwitch: 2, MinHold: 0})
+	current := state.Default("MAIN")
+	now := time.Unix(100, 0)
+
+	first := e.Evaluate(current, Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, Now: now})
+	if first.Kind != Noop || first.State.FailureStreak != 1 {
+		t.Fatalf("first failed sample=%+v", first)
+	}
+
+	cached := e.Evaluate(first.State, Input{CurrentHealthy: false, CurrentHealthySample: false, BackupHealthy: true, Now: now.Add(15 * time.Second)})
+	if cached.Kind != Noop || cached.State.FailureStreak != 1 {
+		t.Fatalf("cached failure was counted again=%+v", cached)
+	}
+
+	second := e.Evaluate(cached.State, Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, Now: now.Add(5 * time.Minute)})
+	if second.Kind != Noop || second.State.FailureStreak != 2 {
+		t.Fatalf("second failed sample=%+v", second)
+	}
+
+	third := e.Evaluate(second.State, Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, Now: now.Add(10 * time.Minute)})
+	if third.Kind != SwitchChannel || third.Channel != "BACKUP-USA" {
+		t.Fatalf("third failed sample=%+v", third)
+	}
+}
+
 func TestNoVerifiedBackupNeverSwitches(t *testing.T) {
 	action := NewEngine(DecisionConfig{FailuresBeforeSwitch: 1}).Evaluate(
-		state.Default("MAIN"), Input{CurrentHealthy: false, BackupHealthy: false, Now: time.Unix(100, 0)})
+		state.Default("MAIN"), Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: false, Now: time.Unix(100, 0)})
 	if action.Kind != Noop {
 		t.Fatalf("action=%s", action.Kind)
 	}
@@ -43,7 +69,7 @@ func TestRecoveryNeedsTwoHealthyCycles(t *testing.T) {
 	e := NewEngine(DecisionConfig{FailuresBeforeSwitch: 1, RecoveriesBeforeSwitch: 2, MinHold: 0})
 	current := state.Default("MAIN")
 	current.CurrentChannel = "BACKUP-USA"
-	input := Input{CurrentHealthy: true, BackupHealthy: true, Now: time.Unix(100, 0)}
+	input := Input{CurrentHealthy: true, CurrentHealthySample: true, BackupHealthy: true, Now: time.Unix(100, 0)}
 	first := e.Evaluate(current, input)
 	if first.Kind != Noop {
 		t.Fatalf("first recovery action=%s", first.Kind)
@@ -56,7 +82,7 @@ func TestRecoveryNeedsTwoHealthyCycles(t *testing.T) {
 
 func TestPurityWarningCannotCreateSwitchAction(t *testing.T) {
 	action := NewEngine(DecisionConfig{FailuresBeforeSwitch: 1}).Evaluate(
-		state.Default("MAIN"), Input{CurrentHealthy: true, BackupHealthy: true, PurityWarning: "datacenter", Now: time.Unix(100, 0)})
+		state.Default("MAIN"), Input{CurrentHealthy: true, CurrentHealthySample: true, BackupHealthy: true, PurityWarning: "datacenter", Now: time.Unix(100, 0)})
 	if action.Kind != Noop {
 		t.Fatalf("purity changed routing: %s", action.Kind)
 	}
@@ -69,14 +95,14 @@ func TestForcedChannelBlocksAutomaticSwitchUntilExpiry(t *testing.T) {
 	current.CurrentChannel = "BACKUP-USA"
 	current.ForcedChannel = "BACKUP-USA"
 	current.ForceUntil = now.Add(time.Minute)
-	action := e.Evaluate(current, Input{CurrentHealthy: true, BackupHealthy: true, Now: now})
+	action := e.Evaluate(current, Input{CurrentHealthy: true, CurrentHealthySample: true, BackupHealthy: true, Now: now})
 	if action.Kind != Noop || action.State.CurrentChannel != "BACKUP-USA" {
 		t.Fatalf("forced action=%+v", action)
 	}
 
 	expired := action.State
 	expired.ForceUntil = now.Add(-time.Second)
-	recovered := e.Evaluate(expired, Input{CurrentHealthy: true, BackupHealthy: true, Now: now})
+	recovered := e.Evaluate(expired, Input{CurrentHealthy: true, CurrentHealthySample: true, BackupHealthy: true, Now: now})
 	if recovered.State.ForcedChannel != "" || recovered.State.ForceUntil != (time.Time{}) {
 		t.Fatalf("force did not expire: %+v", recovered.State)
 	}

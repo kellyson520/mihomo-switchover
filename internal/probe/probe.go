@@ -2,6 +2,8 @@ package probe
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -31,6 +33,43 @@ type Result struct {
 	Status   int
 	Duration time.Duration
 	Err      string
+	// Cause is retained for typed classification inside the process. It is not
+	// serialized or logged directly; Err is the redacted operator-facing form.
+	Cause     error     `json:"-"`
+	ErrorKind ErrorKind `json:"-"`
+}
+
+type ErrorKind string
+
+const (
+	ErrorKindUnknown  ErrorKind = "unknown"
+	ErrorKindCanceled ErrorKind = "canceled"
+	ErrorKindTimeout  ErrorKind = "timeout"
+	ErrorKindDNS      ErrorKind = "dns"
+	ErrorKindTLS      ErrorKind = "tls"
+	ErrorKindTCP      ErrorKind = "tcp"
+	ErrorKindBodyRead ErrorKind = "body_read"
+)
+
+// TransportError preserves a stable category while retaining the original
+// error for errors.Is/errors.As callers.
+type TransportError struct {
+	Kind ErrorKind
+	Err  error
+}
+
+func (e *TransportError) Error() string {
+	if e == nil || e.Err == nil {
+		return string(ErrorKindUnknown)
+	}
+	return e.Err.Error()
+}
+
+func (e *TransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
 }
 
 type ExternalClient struct {
@@ -224,6 +263,8 @@ func (c *ExternalClient) Fetch(ctx context.Context, spec config.ProbeSpec) (Resu
 	if err != nil {
 		result.Class = NetworkError
 		result.Err = err.Error()
+		result.Cause = err
+		result.ErrorKind = ErrorKindUnknown
 		result.Duration = time.Since(started)
 		return result, nil
 	}
@@ -232,6 +273,8 @@ func (c *ExternalClient) Fetch(ctx context.Context, spec config.ProbeSpec) (Resu
 	result.Duration = time.Since(started)
 	if err != nil {
 		result.Class = classifyNetworkError(err)
+		result.Cause = &TransportError{Kind: classifyErrorKind(err), Err: err}
+		result.ErrorKind = classifyErrorKind(err)
 		result.Err = redactError(err)
 		return result, nil
 	}
@@ -240,6 +283,8 @@ func (c *ExternalClient) Fetch(ctx context.Context, spec config.ProbeSpec) (Resu
 	result.Class = ClassifyStatus(resp.StatusCode, spec.ExpectedMin, spec.ExpectedMax)
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
+		result.Cause = readErr
+		result.ErrorKind = ErrorKindBodyRead
 		result.Err = redactError(readErr)
 	}
 	return result, body
@@ -270,6 +315,47 @@ func classifyNetworkError(err error) ResultClass {
 		return NetworkError
 	}
 	return NetworkError
+}
+
+func classifyErrorKind(err error) ErrorKind {
+	if err == nil {
+		return ErrorKindUnknown
+	}
+	if errors.Is(err, context.Canceled) {
+		return ErrorKindCanceled
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrorKindTimeout
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return ErrorKindTimeout
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return ErrorKindDNS
+	}
+	var certificateError x509.CertificateInvalidError
+	if errors.As(err, &certificateError) {
+		return ErrorKindTLS
+	}
+	var unknownAuthority *x509.UnknownAuthorityError
+	if errors.As(err, &unknownAuthority) {
+		return ErrorKindTLS
+	}
+	var hostnameError *x509.HostnameError
+	if errors.As(err, &hostnameError) {
+		return ErrorKindTLS
+	}
+	var recordHeaderError tls.RecordHeaderError
+	if errors.As(err, &recordHeaderError) {
+		return ErrorKindTLS
+	}
+	var opError *net.OpError
+	if errors.As(err, &opError) {
+		return ErrorKindTCP
+	}
+	return ErrorKindUnknown
 }
 
 func redactURL(raw string) string {

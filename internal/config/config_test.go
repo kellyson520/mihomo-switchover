@@ -110,6 +110,17 @@ func TestLoadAppliesConservativeDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadDefaultsPublicProbeIntervalToFiveMinutes(t *testing.T) {
+	data := []byte(strings.Replace(string(validMinimalConfig(t)), "  interval: 15s\n", "", 1))
+	cfg, err := LoadBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Decision.ProbeInterval != 5*time.Minute {
+		t.Fatalf("public probe interval=%s, want 5m", cfg.Decision.ProbeInterval)
+	}
+}
+
 func TestLoadRejectsUnknownFields(t *testing.T) {
 	data := append(validMinimalConfig(t), []byte("unknown: true\n")...)
 	if _, err := LoadBytes(data); err == nil {
@@ -200,11 +211,48 @@ func TestQualityConfigUsesUserDefinedTargetOrderAndDefaults(t *testing.T) {
 	if cfg.Quality.Thresholds.BaselineDropPoints != 20 || cfg.Quality.Thresholds.MinimumConfidence != 70 || cfg.Quality.Thresholds.CandidateMinimumScore != 60 || cfg.Quality.Thresholds.RecoveryMarginPoints != 10 || cfg.Quality.Thresholds.RecoveryConfirmations != 2 {
 		t.Fatalf("quality thresholds=%+v", cfg.Quality.Thresholds)
 	}
-	if cfg.Quality.Stability.MinimumSamples != 3 || cfg.Quality.Stability.GoodLatencyMS != 500 || cfg.Quality.Stability.BadLatencyMS != 3000 {
+	if cfg.Quality.Stability.MinimumSamples != 3 || cfg.Quality.Stability.MinimumCoverage != 10 || cfg.Quality.Stability.GoodLatencyMS != 500 || cfg.Quality.Stability.BadLatencyMS != 3000 {
 		t.Fatalf("quality stability thresholds=%+v", cfg.Quality.Stability)
 	}
 	if cfg.Quality.Retention.Reports != 90 || cfg.Quality.Retention.HistoryDays != 180 {
 		t.Fatalf("quality retention=%+v", cfg.Quality.Retention)
+	}
+}
+
+func TestPuritySourcesParseExplicitRiskKindAndFormat(t *testing.T) {
+	data := append(validMinimalConfig(t), []byte(`
+purity:
+  sources:
+    - id: ip-consensus
+      url: https://identity.example/ip
+      kind: identity
+      format: json
+    - id: risk-a
+      url: https://risk.example/check
+      kind: risk
+      format: json
+`)...)
+	cfg, err := LoadBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Purity.Sources) != 2 || cfg.Purity.Sources[1].Kind != "risk" || cfg.Purity.Sources[1].Format != "json" {
+		t.Fatalf("purity sources=%+v", cfg.Purity.Sources)
+	}
+}
+
+func TestPuritySourcesRejectAmbiguousOrUnsafeDefinitions(t *testing.T) {
+	for _, edit := range []string{
+		"kind: unknown",
+		"format: yaml",
+		"url: http://risk.example/check",
+	} {
+		t.Run(edit, func(t *testing.T) {
+			data := append(validMinimalConfig(t), []byte("\npurity:\n  sources:\n    - id: risk-a\n      "+edit+"\n      kind: risk\n      format: json\n")...)
+			if _, err := LoadBytes(data); err == nil {
+				t.Fatalf("definition %q was accepted", edit)
+			}
+		})
 	}
 }
 
@@ -403,6 +451,7 @@ func TestQualityConfigRejectsInvalidThresholds(t *testing.T) {
 		{name: "candidate score", field: "candidate_minimum_score", value: "101", want: "candidate_minimum_score"},
 		{name: "confirmations", field: "recovery_confirmations", value: "0", want: "recovery_confirmations"},
 		{name: "samples", field: "minimum_samples", value: "0", want: "minimum_samples"},
+		{name: "coverage", field: "minimum_coverage_percent", value: "0", want: "minimum_coverage_percent"},
 		{name: "reports retention", field: "reports", value: "0", want: "reports"},
 		{name: "history retention", field: "history_days", value: "0", want: "history_days"},
 		{name: "good latency", field: "good_latency_ms", value: "0", want: "good_latency_ms"},
@@ -414,7 +463,7 @@ func TestQualityConfigRejectsInvalidThresholds(t *testing.T) {
 			switch tt.field {
 			case "reports", "history_days":
 				data = strings.Replace(data, "      listener: http://127.0.0.1:17991\n", "      listener: http://127.0.0.1:17991\n  retention:\n    "+tt.field+": "+tt.value+"\n", 1)
-			case "minimum_samples", "good_latency_ms", "bad_latency_ms":
+			case "minimum_samples", "minimum_coverage_percent", "good_latency_ms", "bad_latency_ms":
 				data = strings.Replace(data, "      listener: http://127.0.0.1:17991\n", "      listener: http://127.0.0.1:17991\n  stability:\n    "+tt.field+": "+tt.value+"\n", 1)
 			default:
 				data = strings.Replace(data, "      listener: http://127.0.0.1:17991\n", "      listener: http://127.0.0.1:17991\n  thresholds:\n    "+tt.field+": "+tt.value+"\n", 1)

@@ -153,10 +153,11 @@ func TestReadRecommendationsIgnoresStaleInvalidAndCorruptData(t *testing.T) {
 
 func TestGenerateRecommendationPreservesBaselineAndReportIdentity(t *testing.T) {
 	now := time.Now().UTC()
+	stabilityAt := now.Add(time.Hour)
 	target := recommendationTestTarget()
 	key := NodeKey{Target: target.ID, Provider: target.Provider, Node: "node", IPFamily: "ipv4", IP: "198.51.100.10"}
 	report := Report{
-		Identity: key, ObservedAt: now, QualityScore: 90, StabilityScore: 80, EffectiveScore: 87,
+		Identity: key, ObservedAt: now, StabilityObservedAt: stabilityAt, QualityScore: 90, StabilityScore: 80, EffectiveScore: 87,
 		ConfidencePercent: 85, Complete: true, Eligible: true, ProviderAlive: true,
 		ProviderHistoryFresh: true, Provider: ProviderHealth{Alive: true, HistoryFresh: true},
 	}
@@ -168,7 +169,26 @@ func TestGenerateRecommendationPreservesBaselineAndReportIdentity(t *testing.T) 
 	if recommendation.Target != target.ID || recommendation.SourceGroup != target.SourceGroup || recommendation.Provider != target.Provider || recommendation.Node != "node" {
 		t.Fatalf("recommendation routing fields=%+v", recommendation)
 	}
-	if recommendation.Identity != key || recommendation.ReportedAt != now || recommendation.EffectiveScore != 87 || recommendation.BaselineScore != 70 {
+	if recommendation.Identity != key || recommendation.ReportedAt != stabilityAt || recommendation.EffectiveScore != 87 || recommendation.BaselineScore != 70 {
 		t.Fatalf("recommendation identity/score=%+v", recommendation)
+	}
+}
+
+func TestGenerateRecommendationSupportsStaticTargetWithDerivedProviderIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	target := config.QualityTarget{ID: "static", SourceGroup: "STATIC-GROUP", Scope: "all"}
+	key := NodeKey{Target: target.ID, Node: "node", IPFamily: "ipv4", IP: "198.51.100.20"}
+	key.Provider = target.SourceGroup
+	report := Report{
+		Identity: key, ObservedAt: now, QualityScore: 90, StabilityScore: 80, EffectiveScore: 87,
+		ConfidencePercent: 85, Complete: true, Eligible: true, ProviderAlive: true, ProviderHistoryFresh: true,
+	}
+	record := NodeRecord{Identity: key, Baseline: &Baseline{Identity: key, Score: 87}}
+	recommendation, err := GenerateRecommendation(report, record, target, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recommendation.Provider != target.SourceGroup || recommendation.Identity.Provider != target.SourceGroup {
+		t.Fatalf("recommendation=%+v, static target must have a deterministic derived provider identity", recommendation)
 	}
 }

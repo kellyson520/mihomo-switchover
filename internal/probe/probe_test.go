@@ -83,6 +83,20 @@ func TestClassifyStatusAndNetworkErrors(t *testing.T) {
 	}
 }
 
+func TestClassifyErrorKindPreservesTypedNetworkCategories(t *testing.T) {
+	if got := classifyErrorKind(context.DeadlineExceeded); got != ErrorKindTimeout {
+		t.Fatalf("deadline kind=%s, want timeout", got)
+	}
+	dns := &net.DNSError{Err: "no such host", Name: "example.invalid"}
+	if got := classifyErrorKind(dns); got != ErrorKindDNS {
+		t.Fatalf("dns kind=%s, want dns", got)
+	}
+	wrapped := &TransportError{Kind: ErrorKindTCP, Err: dns}
+	if !errors.Is(wrapped, dns) {
+		t.Fatal("TransportError must preserve errors.Is behavior")
+	}
+}
+
 func TestRedactErrorRemovesQueryCredentials(t *testing.T) {
 	err := &url.Error{
 		Op:  "Get",

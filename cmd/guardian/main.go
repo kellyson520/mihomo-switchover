@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -369,7 +371,7 @@ func executeQualityRun(args qualityRunArgs) error {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
-	if err := runQualityScan(ctx, cfg, api, reports, guardianState, logger, args.Target); err != nil {
+	if err := runQualityScan(ctx, cfg, api, reports, guardianState, logger, args.Target, true); err != nil {
 		return err
 	}
 	fmt.Println("quality scan completed")
@@ -389,66 +391,207 @@ func executeQualityDaemon(args qualityDaemonArgs) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
+	schedule := qualityDaemonSchedule{NextSummary: time.Now().UTC(), NextFullScan: time.Now().UTC(), NextReload: time.Now().UTC()}
+	scanResults := make(chan error, 1)
+	scanRunning := false
+	var scanCancel context.CancelFunc
+	stopScan := func() {
+		if scanCancel != nil {
+			scanCancel()
+		}
+	}
+	defer stopScan()
+
 	for {
-		var scanErr error
-		if cfg.Quality.Enabled {
-			scanErr = runQualityScan(ctx, cfg, api, reports, guardianState, logger, "")
+		now := time.Now().UTC()
+		summaryDue, fullScanDue, reloadDue := schedule.due(now, cfg.Quality.Enabled, scanRunning)
+		if summaryDue {
+			summaryErr := runQualityStabilitySummary(ctx, cfg, api, reports, guardianState, logger)
+			if errors.Is(summaryErr, quality.ErrQualityLink) {
+				stopScan()
+				_ = logger.Event("quality_daemon_link_lost", map[string]any{"error": summaryErr.Error()})
+				return summaryErr
+			}
+			if summaryErr != nil {
+				_ = logger.Event("quality_stability_summary_failed", map[string]any{"error": summaryErr.Error()})
+			}
+			schedule.NextSummary = now.Add(qualityStabilityInterval(cfg))
+		}
+
+		if fullScanDue {
+			scanCfg := cfg
+			scanCtx, cancelScan := context.WithCancel(ctx)
+			scanCancel = cancelScan
+			scanRunning = true
+			schedule.NextFullScan = now.Add(qualityFullScanInterval(cfg))
+			go func() {
+				defer cancelScan()
+				scanResults <- runQualityScan(scanCtx, scanCfg, api, reports, guardianState, logger, "", false)
+			}()
+		}
+
+		if reloadDue {
+			next, changed, reloadErr := loader.ReloadIfChanged(cfg)
+			schedule.NextReload = now.Add(qualityReloadInterval(cfg))
+			if reloadErr != nil {
+				_ = logger.Event("quality_config_reload_failed", map[string]any{"error": reloadErr.Error()})
+			} else if changed {
+				if cfg.Mihomo.API != next.Mihomo.API || cfg.Mihomo.Proxy != next.Mihomo.Proxy {
+					stopScan()
+					err := fmt.Errorf("%w: mihomo endpoint changed; restart quality daemon", quality.ErrQualityLink)
+					_ = logger.Event("quality_daemon_link_lost", map[string]any{"error": err.Error()})
+					return err
+				}
+				wasEnabled := cfg.Quality.Enabled
+				cfg = next
+				schedule.NextReload = time.Now().UTC().Add(qualityReloadInterval(cfg))
+				if !cfg.Quality.Enabled {
+					schedule.NextSummary = time.Time{}
+					schedule.NextFullScan = time.Time{}
+					if wasEnabled {
+						stopScan()
+					}
+				} else {
+					schedule.NextSummary = time.Now().UTC()
+					if !scanRunning {
+						schedule.NextFullScan = schedule.NextSummary
+					}
+				}
+				_ = logger.Event("quality_config_reloaded", map[string]any{"enabled": cfg.Quality.Enabled})
+			}
+		}
+
+		select {
+		case scanErr := <-scanResults:
+			scanRunning = false
+			scanCancel = nil
 			if errors.Is(scanErr, quality.ErrQualityLink) {
 				_ = logger.Event("quality_daemon_link_lost", map[string]any{"error": scanErr.Error()})
 				return scanErr
 			}
 			if scanErr != nil {
 				_ = logger.Event("quality_scan_failed", map[string]any{"error": scanErr.Error()})
+				if cfg.Quality.Enabled {
+					schedule.NextFullScan = time.Now().UTC().Add(qualityRetryInterval(cfg))
+				} else {
+					schedule.NextFullScan = time.Time{}
+				}
+			} else if cfg.Quality.Enabled {
+				schedule.NextFullScan = time.Now().UTC().Add(qualityFullScanInterval(cfg))
 			}
-		}
-
-		delay := cfg.Quality.FullScanInterval
-		if scanErr != nil {
-			delay = cfg.Quality.RetryInterval
-		}
-		if delay <= 0 {
-			delay = 24 * time.Hour
-		}
-		if err := waitQualityDaemon(ctx, delay); err != nil {
+		case <-ctx.Done():
 			return nil
+		default:
 		}
 
-		next, changed, reloadErr := loader.ReloadIfChanged(cfg)
-		if reloadErr != nil {
-			_ = logger.Event("quality_config_reload_failed", map[string]any{"error": reloadErr.Error()})
+		wake := schedule.nextWake(time.Now().UTC(), cfg.Quality.Enabled, scanRunning)
+		delay := time.Until(wake)
+		if delay < 0 {
+			delay = 0
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case scanErr := <-scanResults:
+			timer.Stop()
+			scanRunning = false
+			scanCancel = nil
+			if errors.Is(scanErr, quality.ErrQualityLink) {
+				_ = logger.Event("quality_daemon_link_lost", map[string]any{"error": scanErr.Error()})
+				return scanErr
+			}
+			if scanErr != nil {
+				_ = logger.Event("quality_scan_failed", map[string]any{"error": scanErr.Error()})
+				if cfg.Quality.Enabled {
+					schedule.NextFullScan = time.Now().UTC().Add(qualityRetryInterval(cfg))
+				} else {
+					schedule.NextFullScan = time.Time{}
+				}
+			} else if cfg.Quality.Enabled {
+				schedule.NextFullScan = time.Now().UTC().Add(qualityFullScanInterval(cfg))
+			}
+		case <-ctx.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+type qualityDaemonSchedule struct {
+	NextSummary  time.Time
+	NextFullScan time.Time
+	NextReload   time.Time
+}
+
+func (s qualityDaemonSchedule) due(now time.Time, enabled, fullScanRunning bool) (summary, fullScan, reload bool) {
+	return enabled && !s.NextSummary.IsZero() && !now.Before(s.NextSummary),
+		enabled && !fullScanRunning && !s.NextFullScan.IsZero() && !now.Before(s.NextFullScan),
+		!s.NextReload.IsZero() && !now.Before(s.NextReload)
+}
+
+func (s qualityDaemonSchedule) nextWake(now time.Time, enabled, fullScanRunning bool) time.Time {
+	next := s.NextReload
+	if next.IsZero() || next.Before(now) {
+		next = now
+	}
+	if !enabled {
+		return next
+	}
+	for _, candidate := range []time.Time{s.NextSummary, s.NextFullScan} {
+		if fullScanRunning && candidate == s.NextFullScan {
 			continue
 		}
-		if changed {
-			if cfg.Mihomo.API != next.Mihomo.API || cfg.Mihomo.Proxy != next.Mihomo.Proxy {
-				err := fmt.Errorf("%w: mihomo endpoint changed; restart quality daemon", quality.ErrQualityLink)
-				_ = logger.Event("quality_daemon_link_lost", map[string]any{"error": err.Error()})
-				return err
-			}
-			cfg = next
-			_ = logger.Event("quality_config_reloaded", map[string]any{"enabled": cfg.Quality.Enabled})
+		if !candidate.IsZero() && candidate.Before(next) {
+			next = candidate
 		}
 	}
+	return next
 }
 
-func waitQualityDaemon(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+func qualityStabilityInterval(cfg config.Config) time.Duration {
+	if cfg.Quality.Stability.SummaryInterval > 0 {
+		return cfg.Quality.Stability.SummaryInterval
 	}
+	return time.Hour
 }
 
-func runQualityScan(ctx context.Context, cfg config.Config, api quality.MihomoAPI, reports *quality.Store, guardianState *state.Store, logger *logging.Logger, targetID string) error {
+func qualityFullScanInterval(cfg config.Config) time.Duration {
+	if cfg.Quality.FullScanInterval > 0 {
+		return cfg.Quality.FullScanInterval
+	}
+	return 720 * time.Hour
+}
+
+func qualityRetryInterval(cfg config.Config) time.Duration {
+	if cfg.Quality.RetryInterval > 0 {
+		return cfg.Quality.RetryInterval
+	}
+	return 24 * time.Hour
+}
+
+func qualityReloadInterval(cfg config.Config) time.Duration {
+	if cfg.Reload.CheckInterval > 0 {
+		return cfg.Reload.CheckInterval
+	}
+	return 2 * time.Second
+}
+
+func runQualityScan(ctx context.Context, cfg config.Config, api quality.MihomoAPI, reports *quality.Store, guardianState *state.Store, logger *logging.Logger, targetID string, force bool) error {
 	if strings.TrimSpace(targetID) != "" {
 		target, ok := qualityTargetByID(cfg, targetID)
 		if !ok {
 			return fmt.Errorf("quality target %q is not configured", targetID)
 		}
 		scanner := newQualityScanner(api, reports, guardianState, logger)
+		scanner.Force = force
 		scanErr := scanner.ScanTarget(ctx, cfg, target)
+		if scanErr == nil {
+			if progress, progressErr := reports.LoadScanProgress(); progressErr != nil {
+				scanErr = fmt.Errorf("read quality scan progress: %w", progressErr)
+			} else if qualityProgressHasFailures(progress, []string{target.ID}) {
+				scanErr = errors.New("quality scan completed with failed node probes")
+			}
+		}
 		if !errors.Is(scanErr, quality.ErrQualityLink) {
 			if recommendationErr := refreshQualityRecommendations(reports, cfg, []string{target.ID}, time.Now().UTC()); recommendationErr != nil && scanErr == nil {
 				return recommendationErr
@@ -458,9 +601,17 @@ func runQualityScan(ctx context.Context, cfg config.Config, api quality.MihomoAP
 	}
 
 	scanner := newQualityScanner(api, reports, guardianState, logger)
+	scanner.Force = force
 	scanErr := scanner.Scan(ctx, cfg)
 	if errors.Is(scanErr, quality.ErrQualityLink) {
 		return scanErr
+	}
+	if scanErr == nil {
+		if progress, progressErr := reports.LoadScanProgress(); progressErr != nil {
+			scanErr = fmt.Errorf("read quality scan progress: %w", progressErr)
+		} else if qualityProgressHasFailures(progress, cfg.Quality.Order) {
+			scanErr = errors.New("quality scan completed with failed node probes")
+		}
 	}
 	if recommendationErr := refreshQualityRecommendations(reports, cfg, cfg.Quality.Order, time.Now().UTC()); recommendationErr != nil && scanErr == nil {
 		return recommendationErr
@@ -469,6 +620,37 @@ func runQualityScan(ctx context.Context, cfg config.Config, api quality.MihomoAP
 		return fmt.Errorf("apply quality retention: %w", retentionErr)
 	}
 	return scanErr
+}
+
+// runQualityStabilitySummary is deliberately separate from runQualityScan:
+// the former only reads mihomo's existing history and refreshes persisted
+// recommendation inputs, while the latter performs the infrequent full public
+// evidence scan. A summary failure never stops mihomo or the realtime guardian.
+func runQualityStabilitySummary(ctx context.Context, cfg config.Config, api quality.ReadOnlyMihomoAPI, reports *quality.Store, guardianState *state.Store, logger *logging.Logger) error {
+	if !cfg.Quality.Enabled {
+		return nil
+	}
+	summarizer := &quality.StabilitySummarizer{
+		API: api, Reports: reports, State: guardianState, Logger: logger,
+	}
+	summaryErr := summarizer.Summarize(ctx, cfg)
+	if errors.Is(summaryErr, quality.ErrQualityLink) {
+		return summaryErr
+	}
+	recommendationErr := refreshQualityRecommendations(reports, cfg, cfg.Quality.Order, time.Now().UTC())
+	if summaryErr != nil {
+		return summaryErr
+	}
+	return recommendationErr
+}
+
+func qualityProgressHasFailures(progress quality.ScanProgress, targetIDs []string) bool {
+	for _, targetID := range targetIDs {
+		if target, ok := progress.Targets[targetID]; ok && target.Failed > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func newQualityScanner(api quality.MihomoAPI, reports *quality.Store, guardianState *state.Store, logger *logging.Logger) *quality.Scanner {
@@ -522,6 +704,8 @@ func loadQualityDependencies(args commandArgs) (config.Config, *mihomo.Client, *
 
 type qualityStatusOutput struct {
 	Enabled         bool                        `json:"enabled"`
+	DaemonRunning   bool                        `json:"daemon_running"`
+	DaemonPID       int                         `json:"daemon_pid,omitempty"`
 	Order           []string                    `json:"order"`
 	Targets         []qualityTargetStatusOutput `json:"targets"`
 	NodeRecords     int                         `json:"node_records"`
@@ -531,14 +715,21 @@ type qualityStatusOutput struct {
 }
 
 type qualityTargetStatusOutput struct {
-	ID           string    `json:"id"`
-	SourceGroup  string    `json:"source_group"`
-	Provider     string    `json:"provider,omitempty"`
-	Scope        string    `json:"scope"`
-	Records      int       `json:"records"`
-	Baselines    int       `json:"baselines"`
-	LatestAt     time.Time `json:"latest_at,omitempty"`
-	ScanComplete bool      `json:"scan_complete"`
+	ID                   string    `json:"id"`
+	SourceGroup          string    `json:"source_group"`
+	Provider             string    `json:"provider,omitempty"`
+	Scope                string    `json:"scope"`
+	Listener             string    `json:"listener"`
+	ListenerPort         int       `json:"listener_port,omitempty"`
+	Records              int       `json:"records"`
+	Baselines            int       `json:"baselines"`
+	LatestAt             time.Time `json:"latest_at,omitempty"`
+	LatestStabilityAt    time.Time `json:"latest_stability_at,omitempty"`
+	LatestScore          int       `json:"latest_score,omitempty"`
+	LatestQualityScore   int       `json:"latest_quality_score,omitempty"`
+	LatestStabilityScore int       `json:"latest_stability_score,omitempty"`
+	LatestConfidence     int       `json:"latest_confidence_percent,omitempty"`
+	ScanComplete         bool      `json:"scan_complete"`
 }
 
 func executeQualityStatus(args qualityStatusArgs) error {
@@ -562,9 +753,10 @@ func executeQualityStatus(args qualityStatusArgs) error {
 	if err != nil {
 		return fmt.Errorf("read quality scan progress: %w", err)
 	}
-	status := qualityStatusOutput{Enabled: cfg.Quality.Enabled, Order: append([]string(nil), cfg.Quality.Order...), NodeRecords: len(records), Recommendations: len(recommendations), ScanProgress: progress, GeneratedAt: time.Now().UTC()}
+	daemonPID := findQualityDaemonPID()
+	status := qualityStatusOutput{Enabled: cfg.Quality.Enabled, DaemonRunning: daemonPID > 0, DaemonPID: daemonPID, Order: append([]string(nil), cfg.Quality.Order...), NodeRecords: len(records), Recommendations: len(recommendations), ScanProgress: progress, GeneratedAt: time.Now().UTC()}
 	for _, target := range cfg.Quality.Targets {
-		item := qualityTargetStatusOutput{ID: target.ID, SourceGroup: target.SourceGroup, Provider: target.Provider, Scope: target.Scope}
+		item := qualityTargetStatusOutput{ID: target.ID, SourceGroup: target.SourceGroup, Provider: target.Provider, Scope: target.Scope, Listener: target.Listener, ListenerPort: listenerPort(target.Listener)}
 		for _, record := range records {
 			if record.Identity.Target != target.ID {
 				continue
@@ -573,8 +765,17 @@ func executeQualityStatus(args qualityStatusArgs) error {
 			if record.Baseline != nil {
 				item.Baselines++
 			}
-			if record.Latest != nil && record.Latest.ObservedAt.After(item.LatestAt) {
-				item.LatestAt = record.Latest.ObservedAt
+			if record.Latest != nil {
+				if record.Latest.ObservedAt.After(item.LatestAt) {
+					item.LatestAt = record.Latest.ObservedAt
+					item.LatestScore = record.Latest.EffectiveScore
+					item.LatestQualityScore = record.Latest.QualityScore
+					item.LatestStabilityScore = record.Latest.StabilityScore
+					item.LatestConfidence = record.Latest.ConfidencePercent
+				}
+				if record.Latest.StabilityObservedAt.After(item.LatestStabilityAt) {
+					item.LatestStabilityAt = record.Latest.StabilityObservedAt
+				}
 			}
 		}
 		if targetProgress, ok := progress.Targets[target.ID]; ok {
@@ -590,10 +791,55 @@ func executeQualityStatus(args qualityStatusArgs) error {
 	return nil
 }
 
+func listenerPort(raw string) int {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(parsed.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return 0
+	}
+	return port
+}
+
+func findQualityDaemonPID() int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return 0
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "cmdline"))
+		if err != nil {
+			continue
+		}
+		args := strings.FieldsFunc(string(data), func(r rune) bool { return r == 0 })
+		for _, arg := range args[1:] {
+			if arg == "quality-daemon" {
+				return pid
+			}
+		}
+	}
+	return 0
+}
+
 func refreshQualityRecommendations(reports *quality.Store, cfg config.Config, targetIDs []string, now time.Time) error {
 	if reports == nil {
 		return errors.New("quality report store is required")
 	}
+	return reports.WithRecommendationsLock(func() error {
+		return refreshQualityRecommendationsLocked(reports, cfg, targetIDs, now)
+	})
+}
+
+func refreshQualityRecommendationsLocked(reports *quality.Store, cfg config.Config, targetIDs []string, now time.Time) error {
 	existing, err := reports.LoadRecommendations()
 	if err != nil {
 		return err

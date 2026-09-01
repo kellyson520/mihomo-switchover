@@ -71,10 +71,10 @@ func AggregateStability(proxies []mihomo.Proxy, node string, now time.Time, cfg 
 	if cfg.MinimumSamples < 1 {
 		cfg.MinimumSamples = 3
 	}
-	if len(filtered) < cfg.MinimumSamples || !result.Fresh {
-		return result
+	minimumCoverage := cfg.MinimumCoverage
+	if minimumCoverage < 1 {
+		minimumCoverage = 10
 	}
-
 	latencies := make([]int, 0, result.AliveSamples)
 	for _, sample := range filtered {
 		if sample.Delay > 0 {
@@ -91,6 +91,9 @@ func AggregateStability(proxies []mihomo.Proxy, node string, now time.Time, cfg 
 	result.JitterMS = result.P95MS - result.P50MS
 	if result.JitterMS < 0 {
 		result.JitterMS = 0
+	}
+	if len(filtered) < cfg.MinimumSamples || result.CoveragePercent < minimumCoverage || !result.Fresh {
+		return result
 	}
 	result.Known = true
 	result.StabilityScore = calculateStabilityScore(result, cfg)
@@ -148,11 +151,12 @@ func calculateStabilityScore(snapshot StabilitySnapshot, cfg config.QualityStabi
 	jitterScore := latencyScore(snapshot.JitterMS, 0, bad-good)
 	peakScore := latencyScore(snapshot.MaxMS, good, bad)
 	// A single severe peak is meaningful even when p50/p95 look healthy. Keep
-	// it as a separate component instead of letting it disappear into jitter.
-	value := float64(snapshot.AvailabilityPercent)*0.40 +
-		float64(latencyComponent)*0.25 +
-		float64(jitterScore)*0.15 +
-		float64(peakScore)*0.20
+	// it in the volatility component instead of changing the documented
+	// availability/latency/volatility weights.
+	volatilityScore := roundClamp(float64(jitterScore)*0.60 + float64(peakScore)*0.40)
+	value := float64(snapshot.AvailabilityPercent)*0.50 +
+		float64(latencyComponent)*0.30 +
+		float64(volatilityScore)*0.20
 	return roundClamp(value * float64(snapshot.CoveragePercent) / 100)
 }
 

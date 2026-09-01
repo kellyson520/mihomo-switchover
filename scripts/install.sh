@@ -254,8 +254,6 @@ fi
 build_binary() {
     mkdir -p "$REPO_DIR/dist"
     docker run --rm --network "container:$CONTAINER" \
-        -e HTTPS_PROXY=http://127.0.0.1:7890 \
-        -e HTTP_PROXY=http://127.0.0.1:7890 \
         -v "$REPO_DIR:/src" -w /src golang:1.24-alpine \
         sh -c 'go test -mod=vendor ./... && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath -o dist/guardian ./cmd/guardian'
     test -x "$REPO_DIR/dist/guardian"
@@ -271,6 +269,8 @@ old_unit=/etc/systemd/system/mihomo-channel-switch.service
 [ -f "$old_unit" ] && cp -p "$old_unit" "$backup_dir/old-channel-switch.service" || true
 [ -f "$GUARDIAN_ROOT/data/state.json" ] && cp -p "$GUARDIAN_ROOT/data/state.json" "$backup_dir/guardian-state.json" || true
 [ -f "$GUARDIAN_ROOT/guardian.yaml" ] && cp -p "$GUARDIAN_ROOT/guardian.yaml" "$backup_dir/guardian-config.yaml" || true
+[ -d "$GUARDIAN_ROOT/data/ipquality" ] && cp -a "$GUARDIAN_ROOT/data/ipquality" "$backup_dir/quality-store" || true
+[ -f "$GUARDIAN_ROOT/logs/quality.jsonl" ] && cp -p "$GUARDIAN_ROOT/logs/quality.jsonl" "$backup_dir/quality.jsonl" || true
 cat >"$backup_dir/manifest" <<EOF
 compose=$COMPOSE_PATH
 project_dir=$PROJECT_DIR
@@ -285,6 +285,10 @@ guardian_state=$GUARDIAN_ROOT/data/state.json
 guardian_state_present=$([ -f "$GUARDIAN_ROOT/data/state.json" ] && echo 1 || echo 0)
 guardian_config=$GUARDIAN_ROOT/guardian.yaml
 guardian_config_present=$([ -f "$GUARDIAN_ROOT/guardian.yaml" ] && echo 1 || echo 0)
+quality_store=$GUARDIAN_ROOT/data/ipquality
+quality_store_present=$([ -d "$GUARDIAN_ROOT/data/ipquality" ] && echo 1 || echo 0)
+quality_log=$GUARDIAN_ROOT/logs/quality.jsonl
+quality_log_present=$([ -f "$GUARDIAN_ROOT/logs/quality.jsonl" ] && echo 1 || echo 0)
 EOF
 
 build_binary

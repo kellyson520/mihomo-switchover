@@ -45,6 +45,20 @@ type Service struct {
 	engine   *decision.Engine
 	quality  *quality.Store
 	recs     []quality.Recommendation
+	probe    cachedProbeResult
+	purity   cachedPurityResult
+}
+
+type cachedProbeResult struct {
+	Key       string
+	CheckedAt time.Time
+	Healthy   bool
+}
+
+type cachedPurityResult struct {
+	Key       string
+	CheckedAt time.Time
+	Result    purity.Result
 }
 
 func NewService(cfg config.Config, api API, external ExternalProbe, store *state.Store, logger *logging.Logger, qualityStores ...*quality.Store) *Service {
@@ -81,6 +95,9 @@ func (s *Service) UpdateConfig(cfg config.Config) {
 	s.cfg = cfg
 	s.engine = newDecisionEngine(cfg)
 	s.recs = nil
+	// A changed probe/purity configuration must receive fresh public evidence.
+	s.probe = cachedProbeResult{}
+	s.purity = cachedPurityResult{}
 }
 
 func (s *Service) RunCycle(ctx context.Context) error {
@@ -117,26 +134,36 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	}
 
 	mainHealthy, backupHealthy := false, false
+	currentHealthySample := false
+	activeProbeKey := ""
 	if s.state.CurrentChannel == s.cfg.Groups.Main {
-		_, _ = s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
-		activeHealthy := s.activeHealthy(ctx)
+		mainNode, _ := s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
+		activeProbeKey = probeKey(s.cfg.Groups.Main, mainNode)
+		activeHealthy, sampled := s.activeHealthy(ctx, activeProbeKey)
 		mainHealthy = activeHealthy
+		currentHealthySample = sampled
 		if !activeHealthy {
 			_, backupHealthy = s.ensureProvider(ctx, "backup", s.cfg.Groups.Backup, backupGroup)
 		}
 	} else if s.state.CurrentChannel == s.cfg.Groups.Backup {
-		_, _ = s.ensureProvider(ctx, "backup", s.cfg.Groups.Backup, backupGroup)
-		backupHealthy = s.activeHealthy(ctx)
+		backupNode, _ := s.ensureProvider(ctx, "backup", s.cfg.Groups.Backup, backupGroup)
+		activeProbeKey = probeKey(s.cfg.Groups.Backup, backupNode)
+		backupHealthy, _ = s.activeHealthy(ctx, activeProbeKey)
 		_, mainHealthy = s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
+		// Recovery is based on a fresh main provider/delay verification. The
+		// public probe above checks the active backup route and is not the main
+		// recovery sample consumed by the decision engine.
+		currentHealthySample = true
 	} else {
 		return fmt.Errorf("unknown current channel %q", s.state.CurrentChannel)
 	}
-	s.assessPurity(ctx)
+	s.assessPurity(ctx, activeProbeKey)
 
 	action := s.engine.Evaluate(s.state, decision.Input{
-		CurrentHealthy: mainHealthy,
-		BackupHealthy:  backupHealthy,
-		Now:            time.Now(),
+		CurrentHealthy:       mainHealthy,
+		CurrentHealthySample: currentHealthySample,
+		BackupHealthy:        backupHealthy,
+		Now:                  time.Now(),
 	})
 	if s.cfg.Decision.Mode == "observe" && action.Kind == decision.SwitchChannel {
 		s.log("switch_observed", map[string]any{"channel": action.Channel, "reason": action.Reason})
@@ -155,8 +182,27 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	return nil
 }
 
-func (s *Service) assessPurity(ctx context.Context) {
-	if !s.cfg.Purity.Enabled || len(s.cfg.Purity.URLs) == 0 {
+func (s *Service) assessPurity(ctx context.Context, key string) {
+	if !s.cfg.Purity.Enabled {
+		return
+	}
+	urls := append([]string(nil), s.cfg.Purity.URLs...)
+	seen := make(map[string]struct{}, len(urls))
+	for _, rawURL := range urls {
+		seen[rawURL] = struct{}{}
+	}
+	for _, source := range s.cfg.Purity.Sources {
+		if _, exists := seen[source.URL]; exists {
+			continue
+		}
+		seen[source.URL] = struct{}{}
+		urls = append(urls, source.URL)
+	}
+	if len(urls) == 0 {
+		return
+	}
+	now := time.Now().UTC()
+	if s.purity.Key == key && !s.purity.CheckedAt.IsZero() && now.Sub(s.purity.CheckedAt) < s.externalProbeInterval() {
 		return
 	}
 	fetcher, ok := s.external.(ExternalFetcher)
@@ -164,12 +210,17 @@ func (s *Service) assessPurity(ctx context.Context) {
 		s.log("purity_unknown", map[string]any{"reason": "external_fetcher_unavailable"})
 		return
 	}
-	lookups := purity.Collect(ctx, fetcher, s.cfg.Purity.URLs)
+	lookups := purity.Collect(ctx, fetcher, urls)
 	result := purity.Assess(lookups)
+	s.purity = cachedPurityResult{Key: key, CheckedAt: now, Result: result}
 	s.log("purity_advisory", map[string]any{"score": result.Score, "warning": result.Warning, "ip": result.IP})
 }
 
-func (s *Service) activeHealthy(ctx context.Context) bool {
+func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool) {
+	now := time.Now().UTC()
+	if s.probe.Key == key && !s.probe.CheckedAt.IsZero() && now.Sub(s.probe.CheckedAt) < s.externalProbeInterval() {
+		return s.probe.Healthy, false
+	}
 	passed := 0
 	critical := 0
 	for _, item := range s.cfg.Probes {
@@ -183,7 +234,23 @@ func (s *Service) activeHealthy(ctx context.Context) bool {
 			passed++
 		}
 	}
-	return critical > 0 && passed >= s.cfg.Decision.CriticalQuorum
+	healthy := critical > 0 && passed >= s.cfg.Decision.CriticalQuorum
+	s.probe = cachedProbeResult{Key: key, CheckedAt: now, Healthy: healthy}
+	return healthy, true
+}
+
+func (s *Service) externalProbeInterval() time.Duration {
+	if s.cfg.Decision.ProbeInterval > 0 {
+		return s.cfg.Decision.ProbeInterval
+	}
+	return 5 * time.Minute
+}
+
+func probeKey(group, node string) string {
+	if node == "" {
+		return group
+	}
+	return group + "\x00" + node
 }
 
 func (s *Service) ensureProvider(ctx context.Context, provider, groupName string, group mihomo.Proxy) (string, bool) {
@@ -255,10 +322,14 @@ func (s *Service) refreshRecommendations(ctx context.Context) error {
 	}
 	heartbeater, ok := s.api.(mihomoHeartbeater)
 	if !ok {
-		return fmt.Errorf("%w: runtime API does not expose heartbeat", quality.ErrQualityLink)
+		s.recs = nil
+		s.log("quality_recommendations_ignored", map[string]any{"reason": "runtime_api_does_not_expose_heartbeat"})
+		return nil
 	}
 	if err := heartbeater.Heartbeat(ctx); err != nil {
-		return fmt.Errorf("%w: %v", quality.ErrQualityLink, err)
+		s.recs = nil
+		s.log("quality_recommendations_ignored", map[string]any{"reason": "quality_link_unavailable", "error": err.Error()})
+		return nil
 	}
 	maxAge := s.cfg.Quality.FullScanInterval
 	if maxAge <= 0 {

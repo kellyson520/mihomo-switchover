@@ -84,6 +84,7 @@ func scannerConfig(order []string, targets []config.QualityTarget) config.Config
 			SummaryInterval: time.Hour,
 			HistoryWindow:   24 * time.Hour,
 			MinimumSamples:  3,
+			MinimumCoverage: 1,
 			StaleAfter:      time.Hour,
 			GoodLatencyMS:   500,
 			BadLatencyMS:    3000,
@@ -94,7 +95,7 @@ func scannerConfig(order []string, targets []config.QualityTarget) config.Config
 func scannerCompleteCollection() Collection {
 	return Collection{
 		VendorResults: map[string]VendorResult{
-			"openai": {Vendor: "openai", Attempts: 2, Reachable: true, StatusCodes: []int{401, 401}},
+			"openai": {Vendor: "openai", Attempts: 2, SuccessCount: 2, Reachable: true, StatusCodes: []int{401, 401}},
 		},
 		SourceEvidence: []SourceEvidence{
 			{Source: "ip-a", Kind: "ip", Available: true, IP: "198.51.100.10", IPFamily: "ipv4", ASN: "AS64500", Country: "US"},
@@ -107,6 +108,20 @@ func scannerCompleteCollection() Collection {
 		IdentityIP:       "198.51.100.10",
 		IdentityFamily:   "ipv4",
 		IdentityComplete: true,
+	}
+}
+
+func TestScannerSourcesUsesExplicitRiskMetadata(t *testing.T) {
+	cfg := config.Config{Purity: config.PurityConfig{
+		Timeout: time.Second,
+		Sources: []config.PuritySource{
+			{ID: "identity", URL: "https://identity.example/json", Kind: "identity", Format: "json"},
+			{ID: "risk", URL: "https://risk.example/check", Kind: "risk", Format: "json"},
+		},
+	}}
+	sources := scannerSources(cfg)
+	if len(sources) != 2 || sources[1].Kind != SourceKindRisk || sources[1].Format != SourceFormatJSON {
+		t.Fatalf("sources=%+v, explicit risk metadata must be preserved", sources)
 	}
 }
 
@@ -165,8 +180,8 @@ func TestScannerScansConfiguredOrderAndOnlyProviderSourceIntersection(t *testing
 		t.Fatal(err)
 	}
 	want := []scannerSelection{
-		{group: "GUARDIAN-QUALITY-reserve", node: "us-b"},
 		{group: "GUARDIAN-QUALITY-reserve", node: "us-a"},
+		{group: "GUARDIAN-QUALITY-reserve", node: "us-b"},
 		{group: "GUARDIAN-QUALITY-primary", node: "locked-primary"},
 	}
 	if !reflect.DeepEqual(api.selections, want) {
@@ -224,8 +239,8 @@ func TestScannerContinuesAfterNodeFailureAndPersistsCursor(t *testing.T) {
 		t.Fatal(err)
 	}
 	targetProgress := progress.Targets["target"]
-	if !targetProgress.Complete || targetProgress.Cursor != "good" || targetProgress.CursorIndex != 2 || targetProgress.Attempted != 2 || targetProgress.Completed != 1 {
-		t.Fatalf("progress=%+v, want completed cursor with one successful report", targetProgress)
+	if targetProgress.Complete || targetProgress.Failed != 1 || targetProgress.Cursor != "good" || targetProgress.CursorIndex != 2 || targetProgress.Attempted != 2 || targetProgress.Completed != 1 {
+		t.Fatalf("progress=%+v, want incomplete cursor with one failed and one successful report", targetProgress)
 	}
 	records, err := reports.ListNodeRecords()
 	if err != nil {
@@ -233,6 +248,40 @@ func TestScannerContinuesAfterNodeFailureAndPersistsCursor(t *testing.T) {
 	}
 	if len(records) != 1 || records[0].Identity.Node != "good" {
 		t.Fatalf("records=%+v, want only good node report", records)
+	}
+}
+
+func TestScannerRetriesFailedTargetAndRepeatsExpiredFullScan(t *testing.T) {
+	now := time.Now().UTC().Add(time.Minute)
+	api := &scannerFakeAPI{
+		proxies:   map[string]mihomo.Proxy{"GROUP": {Name: "GROUP", All: []string{"node"}}},
+		providers: map[string]mihomo.Provider{"provider": {Name: "provider", Proxies: []mihomo.Proxy{scannerProxy("node", true, 0)}}},
+	}
+	cfg := scannerConfig([]string{"target"}, []config.QualityTarget{{
+		ID: "target", SourceGroup: "GROUP", Provider: "provider", Scope: "all", Listener: "http://127.0.0.1:17990",
+	}})
+	scanner, reports, _, _ := newScannerFixture(t, api, cfg, func(context.Context, *probe.ExternalClient, []SourceSpec, []VendorProbeSpec) (Collection, error) {
+		return scannerCompleteCollection(), nil
+	})
+	scanner.Now = func() time.Time { return now }
+	fingerprint := scannerCandidateFingerprint([]string{"node"})
+	if err := reports.SaveScanProgress(ScanProgress{Targets: map[string]TargetScanProgress{
+		"target": {Target: "target", Provider: "provider", ProviderFingerprint: fingerprint, Complete: true, LastFullScanAt: now.Add(-721 * time.Hour)},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scanner.Scan(context.Background(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if len(api.selections) != 1 {
+		t.Fatalf("expired full scan selections=%v, want one rescan", api.selections)
+	}
+	progress, err := reports.LoadScanProgress()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Targets["target"].LastFullScanAt != now {
+		t.Fatalf("last full scan=%v, want %v", progress.Targets["target"].LastFullScanAt, now)
 	}
 }
 
@@ -258,6 +307,15 @@ func TestScannerResumesFromPersistedCursor(t *testing.T) {
 	}
 	if len(api.selections) != 1 || api.selections[0].node != "second" {
 		t.Fatalf("selections=%+v, want resume at second node", api.selections)
+	}
+}
+
+func TestResumeIndexRetriesInFlightNodeAfterCrash(t *testing.T) {
+	if got := resumeIndex(TargetScanProgress{Cursor: "first", CursorIndex: 0}, []string{"first", "second"}); got != 0 {
+		t.Fatalf("resume index=%d, in-flight first node must be retried", got)
+	}
+	if got := resumeIndex(TargetScanProgress{Cursor: "first", CursorIndex: 1}, []string{"first", "second"}); got != 1 {
+		t.Fatalf("resume index=%d, completed first node must not be repeated", got)
 	}
 }
 
@@ -347,5 +405,21 @@ func TestScannerUsesExactSourceGroupAndGeneratedQualityGroup(t *testing.T) {
 	}
 	if strings.Contains(api.selections[0].group, "CHANNEL") || strings.Contains(api.selections[0].group, "Exact Group") {
 		t.Fatalf("selection escaped generated group boundary: %+v", api.selections[0])
+	}
+}
+
+func TestScannerRejectsEmptyProviderIntersection(t *testing.T) {
+	api := &scannerFakeAPI{
+		proxies:   map[string]mihomo.Proxy{"GROUP": {Name: "GROUP", All: []string{"node-a"}}},
+		providers: map[string]mihomo.Provider{"provider": {Name: "provider", Proxies: []mihomo.Proxy{{Name: "node-b"}}}},
+	}
+	cfg := scannerConfig([]string{"target"}, []config.QualityTarget{{
+		ID: "target", SourceGroup: "GROUP", Provider: "provider", Scope: "all", Listener: "http://127.0.0.1:17990",
+	}})
+	scanner, _, _, _ := newScannerFixture(t, api, cfg, func(context.Context, *probe.ExternalClient, []SourceSpec, []VendorProbeSpec) (Collection, error) {
+		return scannerCompleteCollection(), nil
+	})
+	if err := scanner.Scan(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "no candidates") {
+		t.Fatalf("scan error=%v, empty intersection must fail closed", err)
 	}
 }

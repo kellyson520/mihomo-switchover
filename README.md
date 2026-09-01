@@ -8,8 +8,8 @@ mihomo 容器内，guardian 不读取或修改账号、额度、登录态或业�
 - `/mihomo` 是生产代理主进程；`start-guardian.sh` 只在其旁边启动 guardian。
 - guardian 崩溃、配置错误、API 暂时失联或升级时，只重启 guardian，绝不停止或给
   mihomo 发信号。只有 Docker 正常停止容器时，启动器才同时清理两个子进程。
-- `9090` 只用于容器内回环控制 API，必须直连；所有 OpenAI、Gemini、Anthropic、
-  OpenRouter、DeepSeek 和纯净度探测都强制经容器内 `7890` 代理。
+- 控制 API 只用于容器内回环直连；所有 OpenAI、Gemini、Anthropic、OpenRouter、
+  DeepSeek 和纯净度探测都强制经自动发现的容器内回环代理端口。
 - 不使用 API Key；厂商入口收到 `200–499` 都代表入口可达，`5xx`、DNS、TCP、TLS
   和超时才算本次探测失败。
 - 纯净度/IP/ASN 只产生告警和评分，默认不能触发自动切换。
@@ -46,7 +46,9 @@ sudo ./scripts/install.sh
 ├── guardian.yaml          # 唯一需要人工/AI 编辑的行为配置
 ├── controller_secret
 ├── data/state.json
+├── data/ipquality/       # reports, baselines, scan progress and audit
 ├── logs/guardian.jsonl
+├── logs/quality.jsonl
 └── backups/
 ```
 
@@ -57,6 +59,10 @@ sudo ./scripts/install.sh
 生产流量的 `/proxies/<节点>/delay` 调用，因为当前 mihomo Alpha 对这类路径返回 404；
 没有 `alive` 和健康历史的候选保持未知并拒绝切换。
 
+主循环默认每 15 秒运行，但 OpenAI、Gemini 等公网厂商探测默认每 5 分钟刷新一次；
+缓存期间不会重复访问厂商，也不会重复累计同一个失败。修改 `decision.probe_interval`
+可热重载调整该频率，生产建议不要低于 5 分钟。
+
 ## 运维命令
 
 ```sh
@@ -66,11 +72,29 @@ docker exec mihomo-cliproxy /guardian/bin/guardian probe --config /guardian/guar
 docker exec mihomo-cliproxy /guardian/bin/guardian switch backup --config /guardian/guardian.yaml
 docker exec mihomo-cliproxy /guardian/bin/guardian auto --config /guardian/guardian.yaml
 docker exec mihomo-cliproxy /guardian/bin/guardian reload --config /guardian/guardian.yaml
+docker exec mihomo-cliproxy /guardian/bin/guardian quality status --config /guardian/guardian.yaml --data /guardian/data
+docker exec mihomo-cliproxy /guardian/bin/guardian quality run --config /guardian/guardian.yaml --data /guardian/data --logs /guardian/logs --secret-file /guardian/controller_secret
 ```
 
 `status.sh --read-only` 不创建文件、不改 API、不重启容器。人工 `switch` 有 30 分钟
 保护期并写入审计日志；`auto` 清除强制状态。guardian API 失联超过宽限期时自身退出，
 启动器只重启 guardian，mihomo 和代理端口继续由原进程提供服务。
+
+`quality status` 只读显示质量 daemon、目标 listener、扫描进度、节点记录、baseline
+数量和最新质量/稳定性/综合分，不回显 secret、节点订阅地址或账号信息。需要对单个目标
+立即扫描时给 `quality run` 增加 `--target TARGET_ID`。只有在确认当前 IP、供应商数据和
+报告确实发生长期变化时，才使用精确身份重置 baseline：
+
+质量 daemon 每个 `stability.summary_interval` 周期只读取 mihomo 已有的 provider history，
+不发起公网请求、不调用 delay、不选择节点；只有已经完成 IP 身份确认的节点才会更新
+`stability.json`、`stability-history.jsonl` 和推荐输入。`quality status` 中的
+`latest_stability_at` 是最近一次这类汇总时间，和全量质量报告时间分开显示。
+
+```sh
+docker exec mihomo-cliproxy /guardian/bin/guardian quality baseline-reset \
+  --config /guardian/guardian.yaml --data /guardian/data \
+  --target TARGET_ID --node NODE_NAME --ip EXIT_IP
+```
 
 ## 给 Agent 和运维人员的文档
 
@@ -85,11 +109,12 @@ sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
 ```
 
 回滚前检查最新备份清单，恢复 Compose、mihomo 配置和旧 systemd 服务；guardian 的
-状态、日志和备份目录保留，不删除节点或审计数据。
+状态、质量 reports/baselines/scan progress、日志和备份目录保留，不删除节点或审计数据。
 
 ## 本地验证
 
-宿主机没有 Go 时，使用 mihomo 的网络命名空间作为构建器出口：
+宿主机没有 Go 时，使用 mihomo 的网络命名空间作为构建环境；Go 依赖已 vendor，
+构建步骤不访问公网，也不会把代理端口写死：
 
 ```sh
 make check CONTAINER=mihomo-cliproxy

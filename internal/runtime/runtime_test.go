@@ -3,13 +3,14 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 type fakeLink struct {
 	heartbeats     []error
-	heartbeatCalls int
+	heartbeatCalls atomic.Int32
 	decisionCalls  int
 	terminated     bool
 }
@@ -28,8 +29,7 @@ func (f *reloadableFakeLink) Reload() error {
 func (f *reloadableFakeLink) CycleInterval() time.Duration { return f.cycleInterval }
 
 func (f *fakeLink) Heartbeat(context.Context) error {
-	index := f.heartbeatCalls
-	f.heartbeatCalls++
+	index := int(f.heartbeatCalls.Add(1)) - 1
 	if index >= len(f.heartbeats) {
 		return errors.New("mihomo down")
 	}
@@ -78,7 +78,7 @@ func TestRuntimeChecksOptionalConfigReloadAfterHeartbeat(t *testing.T) {
 	fake := &reloadableFakeLink{fakeLink: fakeLink{heartbeats: []error{nil}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		for fake.heartbeatCalls == 0 {
+		for fake.heartbeatCalls.Load() == 0 {
 			time.Sleep(time.Millisecond)
 		}
 		cancel()

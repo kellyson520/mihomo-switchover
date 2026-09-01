@@ -128,7 +128,7 @@ func TestResetQualityBaselineAuditsExactIdentityAndKeepsHistory(t *testing.T) {
 	reports := quality.NewStore(t.TempDir())
 	key := quality.NodeKey{Target: "primary", Provider: "provider", Node: "node-a", IPFamily: "ipv4", IP: "198.51.100.10"}
 	firstAt := time.Date(2026, 8, 28, 1, 0, 0, 0, time.UTC)
-	first := quality.Report{Identity: key, ObservedAt: firstAt, QualityScore: 80, StabilityScore: 80, EffectiveScore: 80, ConfidencePercent: 90, Complete: true}
+	first := quality.Report{Identity: key, ObservedAt: firstAt, QualityScore: 80, StabilityScore: 80, EffectiveScore: 80, ConfidencePercent: 90, Complete: true, Eligible: true}
 	second := first
 	second.ObservedAt = firstAt.Add(time.Hour)
 	second.QualityScore = 60
@@ -198,9 +198,81 @@ func (qualityLinkTestAPI) SetProxy(context.Context, string, string) error {
 func TestRunQualityScanReturnsQualityLinkWithoutSelectingOrProbing(t *testing.T) {
 	reports := quality.NewStore(t.TempDir())
 	cfg := config.Config{Quality: config.QualityConfig{Enabled: true}}
-	err := runQualityScan(context.Background(), cfg, qualityLinkTestAPI{}, reports, nil, nil, "")
+	err := runQualityScan(context.Background(), cfg, qualityLinkTestAPI{}, reports, nil, nil, "", false)
 	if !errors.Is(err, quality.ErrQualityLink) {
 		t.Fatalf("quality scan error=%v, want quality-link error", err)
+	}
+}
+
+func TestQualityProgressFailuresTriggerRetryScheduling(t *testing.T) {
+	progress := quality.ScanProgress{Targets: map[string]quality.TargetScanProgress{
+		"primary": {Target: "primary", Complete: true, Failed: 1},
+		"reserve": {Target: "reserve", Complete: true},
+	}}
+	if !qualityProgressHasFailures(progress, []string{"primary", "reserve"}) {
+		t.Fatal("failed target must trigger retry scheduling")
+	}
+	if qualityProgressHasFailures(progress, []string{"reserve"}) {
+		t.Fatal("unfailed target must not trigger retry scheduling")
+	}
+}
+
+func TestQualityDaemonUsesConfiguredReloadIntervalWhenDisabled(t *testing.T) {
+	cfg := config.Config{
+		Reload: config.ReloadConfig{CheckInterval: 2 * time.Second},
+		Quality: config.QualityConfig{
+			FullScanInterval: 720 * time.Hour,
+			RetryInterval:    24 * time.Hour,
+			Enabled:          false,
+		},
+	}
+	if got := qualityReloadInterval(cfg); got != 2*time.Second {
+		t.Fatalf("disabled quality reload interval=%s, want reload interval", got)
+	}
+}
+
+func TestQualityDaemonUsesConfiguredStabilitySummaryCadence(t *testing.T) {
+	cfg := config.Config{Quality: config.QualityConfig{
+		Enabled:          true,
+		FullScanInterval: 720 * time.Hour,
+		RetryInterval:    24 * time.Hour,
+		Stability: config.QualityStabilityConfig{
+			SummaryInterval: time.Hour,
+		},
+	}}
+	if got := qualityStabilityInterval(cfg); got != time.Hour {
+		t.Fatalf("stability summary interval=%s, want hourly cadence", got)
+	}
+}
+
+func TestQualityDaemonDeadlinesKeepHourlySummarySeparateFromFullScan(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	schedule := qualityDaemonSchedule{
+		NextSummary:  now,
+		NextFullScan: now.Add(720 * time.Hour),
+		NextReload:   now.Add(2 * time.Second),
+	}
+	summaryDue, fullDue, reloadDue := schedule.due(now, true, false)
+	if !summaryDue || fullDue || reloadDue {
+		t.Fatalf("due at summary wake: summary=%v full=%v reload=%v", summaryDue, fullDue, reloadDue)
+	}
+
+	if got := schedule.nextWake(now, true, false); !got.Equal(now) {
+		t.Fatalf("next wake=%s, due summary should run immediately", got)
+	}
+	if got := (qualityDaemonSchedule{
+		NextSummary:  now.Add(time.Hour),
+		NextFullScan: now.Add(720 * time.Hour),
+		NextReload:   now.Add(2 * time.Second),
+	}).nextWake(now, true, false); !got.Equal(now.Add(2 * time.Second)) {
+		t.Fatalf("next wake=%s, reload deadline must not wait for full scan", got)
+	}
+	if got := (qualityDaemonSchedule{
+		NextSummary:  now.Add(-time.Hour),
+		NextFullScan: now.Add(-time.Hour),
+		NextReload:   now.Add(2 * time.Second),
+	}).nextWake(now, false, false); !got.Equal(now.Add(2 * time.Second)) {
+		t.Fatalf("disabled quality next wake=%s, must not busy-loop on stale scan deadlines", got)
 	}
 }
 

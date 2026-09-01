@@ -22,11 +22,12 @@ type DecisionConfig struct {
 }
 
 type Input struct {
-	CurrentHealthy bool
-	BackupHealthy  bool
-	BackupNode     string
-	PurityWarning  string
-	Now            time.Time
+	CurrentHealthy       bool
+	CurrentHealthySample bool
+	BackupHealthy        bool
+	BackupNode           string
+	PurityWarning        string
+	Now                  time.Time
 }
 
 type Candidate struct {
@@ -86,6 +87,9 @@ func (e *Engine) Evaluate(current state.State, input Input) Action {
 	}
 	if current.CurrentChannel == e.cfg.MainChannel {
 		current.RecoveryStreak = 0
+		if !input.CurrentHealthySample {
+			return Action{Kind: Noop, Reason: "current health sample is cached", State: current}
+		}
 		if input.CurrentHealthy {
 			current.FailureStreak = 0
 			return Action{Kind: Noop, Reason: "main healthy", State: current}
@@ -109,6 +113,9 @@ func (e *Engine) Evaluate(current state.State, input Input) Action {
 
 	if current.CurrentChannel == e.cfg.BackupChannel {
 		current.FailureStreak = 0
+		if !input.CurrentHealthySample {
+			return Action{Kind: Noop, Reason: "main recovery sample is not fresh", State: current}
+		}
 		if !input.CurrentHealthy {
 			current.RecoveryStreak = 0
 			return Action{Kind: Noop, Reason: "main has not recovered", State: current}

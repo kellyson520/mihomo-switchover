@@ -49,6 +49,18 @@ service=$(get_value service)
 [ -n "$compose" ] && [ -n "$project_dir" ] || { echo "backup manifest is incomplete" >&2; exit 1; }
 
 echo "using backup: $backup_dir"
+# Preserve current quality history and logs before restoring deployment
+# artifacts. Rollback intentionally does not delete or replace live quality
+# data: reports, baselines, scan progress, and audit records remain available
+# for diagnosis after the code/compose rollback.
+preserved_dir="$backup_root/rollback-preserved-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+mkdir -p "$preserved_dir"
+if [ -d "$guardian_root/data/ipquality" ]; then
+    cp -a "$guardian_root/data/ipquality" "$preserved_dir/quality-store"
+fi
+if [ -f "$guardian_root/logs/quality.jsonl" ]; then
+    cp -p "$guardian_root/logs/quality.jsonl" "$preserved_dir/quality.jsonl"
+fi
 cp -p "$backup_dir/compose.yml" "$compose.rollback.tmp"
 mv "$compose.rollback.tmp" "$compose"
 if [ "$(get_value config_present)" = 1 ] && [ -f "$backup_dir/mihomo-config.yaml" ]; then
@@ -83,4 +95,4 @@ if command -v systemctl >/dev/null 2>&1 && [ "$(get_value old_unit_present)" = 1
     systemctl daemon-reload
     systemctl enable --now mihomo-channel-switch.service
 fi
-echo "rollback restored compose and legacy switcher; guardian data/logs/backups were retained"
+echo "rollback restored compose and legacy switcher; quality history/logs were retained (preserved=$preserved_dir)"

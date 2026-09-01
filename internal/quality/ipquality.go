@@ -334,6 +334,20 @@ func classifyTransportErrorWithContext(ctx context.Context, message string) Repo
 }
 
 func classifyProbeResult(ctx context.Context, fetched probe.Result) ReportErrorCode {
+	if fetched.Cause != nil {
+		switch fetched.ErrorKind {
+		case probe.ErrorKindCanceled:
+			return ErrorCanceled
+		case probe.ErrorKindTimeout:
+			return ErrorTimeout
+		case probe.ErrorKindDNS:
+			return ErrorDNS
+		case probe.ErrorKindTLS:
+			return ErrorTLS
+		case probe.ErrorKindTCP:
+			return ErrorTCP
+		}
+	}
 	if fetched.Class == probe.NetworkError || fetched.Status == 0 {
 		return classifyTransportErrorWithContext(ctx, fetched.Err)
 	}
@@ -400,6 +414,7 @@ func parseJSONEvidence(evidence *SourceEvidence, body []byte) error {
 		if err := setEvidenceIP(evidence, fmt.Sprint(value)); err != nil {
 			// An explicitly present but malformed high-priority value must not
 			// silently turn lower-priority nested data into trusted identity.
+			return err
 		}
 	}
 	setStringField(values, "asn", &evidence.ASN, "as", "autonomous_system")

@@ -47,6 +47,7 @@ type ProvidersConfig struct {
 type DecisionConfig struct {
 	Mode                   string        `yaml:"mode"`
 	Interval               time.Duration `yaml:"-"`
+	ProbeInterval          time.Duration `yaml:"-"`
 	FailuresBeforeSwitch   int           `yaml:"failures_before_switch"`
 	RecoveriesBeforeSwitch int           `yaml:"recoveries_before_switch"`
 	MinHold                time.Duration `yaml:"-"`
@@ -68,10 +69,22 @@ type ProbeSpec struct {
 }
 
 type PurityConfig struct {
-	Enabled         bool          `yaml:"enabled"`
-	AutomaticSwitch bool          `yaml:"automatic_switch"`
-	URLs            []string      `yaml:"urls"`
-	Timeout         time.Duration `yaml:"-"`
+	Enabled         bool           `yaml:"enabled"`
+	AutomaticSwitch bool           `yaml:"automatic_switch"`
+	URLs            []string       `yaml:"urls"`
+	Sources         []PuritySource `yaml:"sources"`
+	Timeout         time.Duration  `yaml:"-"`
+}
+
+// PuritySource is an explicitly configured public evidence endpoint. Keeping
+// kind and format in the behavior file avoids guessing whether an endpoint is
+// an identity or reputation source from its URL spelling.
+type PuritySource struct {
+	ID       string `yaml:"id"`
+	URL      string `yaml:"url"`
+	Kind     string `yaml:"kind"`
+	Format   string `yaml:"format"`
+	Critical bool   `yaml:"critical"`
 }
 
 type QualityConfig struct {
@@ -108,6 +121,7 @@ type QualityStabilityConfig struct {
 	SummaryInterval time.Duration `yaml:"-"`
 	HistoryWindow   time.Duration `yaml:"-"`
 	MinimumSamples  int           `yaml:"minimum_samples"`
+	MinimumCoverage int           `yaml:"minimum_coverage_percent"`
 	StaleAfter      time.Duration `yaml:"-"`
 	GoodLatencyMS   int           `yaml:"good_latency_ms"`
 	BadLatencyMS    int           `yaml:"bad_latency_ms"`
@@ -142,6 +156,7 @@ type rawConfig struct {
 type rawDecision struct {
 	Mode                   string `yaml:"mode"`
 	Interval               string `yaml:"interval"`
+	ProbeInterval          string `yaml:"probe_interval"`
 	FailuresBeforeSwitch   int    `yaml:"failures_before_switch"`
 	RecoveriesBeforeSwitch int    `yaml:"recoveries_before_switch"`
 	MinHold                string `yaml:"min_hold"`
@@ -163,10 +178,19 @@ type rawProbe struct {
 }
 
 type rawPurity struct {
-	Enabled         bool     `yaml:"enabled"`
-	AutomaticSwitch bool     `yaml:"automatic_switch"`
-	URLs            []string `yaml:"urls"`
-	Timeout         string   `yaml:"timeout"`
+	Enabled         bool              `yaml:"enabled"`
+	AutomaticSwitch bool              `yaml:"automatic_switch"`
+	URLs            []string          `yaml:"urls"`
+	Sources         []rawPuritySource `yaml:"sources"`
+	Timeout         string            `yaml:"timeout"`
+}
+
+type rawPuritySource struct {
+	ID       string `yaml:"id"`
+	URL      string `yaml:"url"`
+	Kind     string `yaml:"kind"`
+	Format   string `yaml:"format"`
+	Critical bool   `yaml:"critical"`
 }
 
 type rawQuality struct {
@@ -203,6 +227,7 @@ type rawQualityStability struct {
 	SummaryInterval string `yaml:"summary_interval"`
 	HistoryWindow   string `yaml:"history_window"`
 	MinimumSamples  *int   `yaml:"minimum_samples"`
+	MinimumCoverage *int   `yaml:"minimum_coverage_percent"`
 	StaleAfter      string `yaml:"stale_after"`
 	GoodLatencyMS   *int   `yaml:"good_latency_ms"`
 	BadLatencyMS    *int   `yaml:"bad_latency_ms"`
@@ -252,6 +277,10 @@ func normalize(raw rawConfig) (Config, error) {
 	cfg.Decision.Interval, err = durationOrDefault(raw.Decision.Interval, 15*time.Second)
 	if err != nil {
 		return Config{}, fieldError("decision.interval", err)
+	}
+	cfg.Decision.ProbeInterval, err = durationOrDefault(raw.Decision.ProbeInterval, 5*time.Minute)
+	if err != nil {
+		return Config{}, fieldError("decision.probe_interval", err)
 	}
 	cfg.Decision.MinHold, err = durationOrDefault(raw.Decision.MinHold, 120*time.Second)
 	if err != nil {
@@ -306,6 +335,11 @@ func normalize(raw rawConfig) (Config, error) {
 	cfg.Purity.Enabled = raw.Purity.Enabled
 	cfg.Purity.AutomaticSwitch = raw.Purity.AutomaticSwitch
 	cfg.Purity.URLs = append([]string(nil), raw.Purity.URLs...)
+	for _, source := range raw.Purity.Sources {
+		cfg.Purity.Sources = append(cfg.Purity.Sources, PuritySource{
+			ID: source.ID, URL: source.URL, Kind: source.Kind, Format: source.Format, Critical: source.Critical,
+		})
+	}
 	cfg.Purity.Timeout, err = durationOrDefault(raw.Purity.Timeout, 5*time.Second)
 	if err != nil {
 		return Config{}, fieldError("purity.timeout", err)
@@ -386,6 +420,7 @@ func normalizeQuality(raw *rawQuality) (QualityConfig, error) {
 		return QualityConfig{}, fieldError("quality.stability.stale_after", err)
 	}
 	quality.Stability.MinimumSamples = intOrDefault(raw.Stability.MinimumSamples, 3)
+	quality.Stability.MinimumCoverage = intOrDefault(raw.Stability.MinimumCoverage, 10)
 	quality.Stability.GoodLatencyMS = intOrDefault(raw.Stability.GoodLatencyMS, 500)
 	quality.Stability.BadLatencyMS = intOrDefault(raw.Stability.BadLatencyMS, 3000)
 	quality.Retention.Reports = intOrDefault(raw.Retention.Reports, 90)
@@ -477,6 +512,31 @@ func validate(cfg Config) error {
 		parsed, err := url.Parse(rawURL)
 		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" {
 			return fmt.Errorf("purity url %q must be an https url", rawURL)
+		}
+	}
+	sourceIDs := make(map[string]struct{}, len(cfg.Purity.Sources))
+	for _, source := range cfg.Purity.Sources {
+		if strings.TrimSpace(source.ID) == "" || strings.TrimSpace(source.URL) == "" {
+			return errors.New("each purity source requires id and url")
+		}
+		sourceID := strings.ToLower(strings.TrimSpace(source.ID))
+		if _, exists := sourceIDs[sourceID]; exists {
+			return fmt.Errorf("duplicate purity source id %q", source.ID)
+		}
+		sourceIDs[sourceID] = struct{}{}
+		parsed, err := url.Parse(source.URL)
+		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
+			return fmt.Errorf("purity source %q must be an https URL without credentials", source.ID)
+		}
+		switch source.Kind {
+		case "ip", "identity", "risk":
+		default:
+			return fmt.Errorf("purity source %q kind must be ip, identity, or risk", source.ID)
+		}
+		switch source.Format {
+		case "text", "json":
+		default:
+			return fmt.Errorf("purity source %q format must be text or json", source.ID)
 		}
 	}
 	return nil
@@ -576,6 +636,9 @@ func validateQuality(quality QualityConfig, mihomo MihomoConfig) error {
 	stability := quality.Stability
 	if stability.MinimumSamples < 1 {
 		return errors.New("quality.stability.minimum_samples must be positive")
+	}
+	if stability.MinimumCoverage < 1 || stability.MinimumCoverage > 100 {
+		return errors.New("quality.stability.minimum_coverage_percent must be between 1 and 100")
 	}
 	if stability.GoodLatencyMS < 1 || stability.BadLatencyMS < 1 || stability.BadLatencyMS <= stability.GoodLatencyMS {
 		return errors.New("quality.stability latency thresholds must be positive and bad_latency_ms greater than good_latency_ms")

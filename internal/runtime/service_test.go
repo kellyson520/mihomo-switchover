@@ -143,12 +143,50 @@ func (f fakeExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Resu
 	return result
 }
 
+type countingExternal struct {
+	healthy bool
+	checks  int
+}
+
+func (f *countingExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
+	f.checks++
+	result := probe.Result{ProbeID: spec.ID}
+	if f.healthy {
+		result.Class = probe.ReachableHTTP
+	} else {
+		result.Class = probe.NetworkError
+	}
+	return result
+}
+
 func testServiceConfig() config.Config {
 	return config.Config{
 		Mihomo:   config.MihomoConfig{API: "http://127.0.0.1:9090", Proxy: "http://127.0.0.1:7890", SecretFile: "/tmp/secret"},
 		Groups:   config.GroupsConfig{Channel: "CHANNEL", Main: "MAIN", Backup: "BACKUP-USA"},
 		Decision: config.DecisionConfig{Mode: "auto", Interval: time.Second, FailuresBeforeSwitch: 1, RecoveriesBeforeSwitch: 1, MinHold: 0, LinkLossGrace: time.Second, CriticalQuorum: 1},
 		Probes:   []config.ProbeSpec{{ID: "openai", URL: "https://api.openai.com/v1/models", Critical: true, Enabled: true, ExpectedMin: 200, ExpectedMax: 499, Timeout: time.Second, DelayTimeout: time.Second}},
+	}
+}
+
+func TestServiceCachesPublicProbeDuringProbeInterval(t *testing.T) {
+	api := &fakeAPI{groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main", All: []string{"main"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup", All: []string{"backup"}},
+	}, delays: map[string]error{}}
+	external := &countingExternal{healthy: true}
+	cfg := testServiceConfig()
+	cfg.Decision.ProbeInterval = time.Hour
+	service := NewService(cfg, api, external, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil)
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.checks != 1 {
+		t.Fatalf("public probe checks=%d, want one fresh check within interval", external.checks)
 	}
 }
 
@@ -356,6 +394,27 @@ func TestServiceKeepsStickyNodeWhenHigherRecommendationIsNotNeeded(t *testing.T)
 	}
 }
 
+func TestServiceIgnoresQualityHeartbeatFailureAndKeepsRealtimePath(t *testing.T) {
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{}
+	cfg.Quality = serviceQualityConfig()
+	api := &fakeAPI{heartbeatErr: errors.New("quality link unavailable"), groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main-current", All: []string{"main-current"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup-current", All: []string{"backup-current"}},
+	}}
+	service := NewService(cfg, api, fakeExternal{healthy: true}, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil, quality.NewStore(t.TempDir()+"/quality"))
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatalf("quality link failure must not stop realtime guardian: %v", err)
+	}
+	for _, call := range api.setCalls {
+		if call.group == cfg.Groups.Channel {
+			t.Fatalf("quality link failure caused an unexpected channel write: %+v", api.setCalls)
+		}
+	}
+}
+
 func TestServiceReleasesDroppedStickyBelowCandidateMinimum(t *testing.T) {
 	now := time.Now().UTC()
 	api := &fakeAPI{
@@ -399,7 +458,7 @@ func TestServiceReleasesDroppedStickyBelowCandidateMinimum(t *testing.T) {
 	}
 }
 
-func TestServiceQualityLinkLossFailsClosedBeforeAnySelection(t *testing.T) {
+func TestServiceQualityLinkLossDoesNotTriggerQualityDrivenSelection(t *testing.T) {
 	cfg := testServiceConfig()
 	cfg.Quality = serviceQualityConfig()
 	api := &fakeAPI{heartbeatErr: errors.New("mihomo disconnected")}
@@ -407,8 +466,8 @@ func TestServiceQualityLinkLossFailsClosedBeforeAnySelection(t *testing.T) {
 	service := NewService(cfg, api, fakeExternal{healthy: true}, stateStore, nil, quality.NewStore(t.TempDir()+"/quality"))
 
 	err := service.RunCycle(context.Background())
-	if !errors.Is(err, quality.ErrQualityLink) {
-		t.Fatalf("error=%v, want quality link error", err)
+	if err == nil || errors.Is(err, quality.ErrQualityLink) {
+		t.Fatalf("error=%v, quality link must be advisory and the real API failure must remain visible", err)
 	}
 	if len(api.setCalls) != 0 {
 		t.Fatalf("selection occurred after mihomo link loss: %+v", api.setCalls)

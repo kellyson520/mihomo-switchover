@@ -25,6 +25,8 @@ const (
 	stabilityFile                 = "stability.json"
 	stabilityHistoryFile          = "stability-history.jsonl"
 	recommendationsFile           = "recommendations.json"
+	recommendationsLockFile       = "recommendations.lock"
+	scanRunLockFile               = "scan-run.lock"
 	scanProgressFile              = "scan-progress.json"
 	scanLockFile                  = "scan.lock"
 	storageFileMode               = 0600
@@ -79,8 +81,12 @@ func (s *Store) StabilityHistoryPath() string {
 func (s *Store) RecommendationsPath() string {
 	return filepath.Join(s.root, recommendationsFile)
 }
+func (s *Store) RecommendationsLockPath() string {
+	return filepath.Join(s.root, recommendationsLockFile)
+}
 func (s *Store) ScanProgressPath() string { return filepath.Join(s.root, scanProgressFile) }
 func (s *Store) ScanLockPath() string     { return filepath.Join(s.root, scanLockFile) }
+func (s *Store) ScanRunLockPath() string  { return filepath.Join(s.root, scanRunLockFile) }
 func (s *Store) LatestPath(target string) string {
 	return s.latestPath(target)
 }
@@ -119,6 +125,69 @@ func (s *Store) withLock(fn func() error) error {
 		return err
 	}
 	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// withScanRunLock protects the whole select -> collect -> persist lifecycle
+// of a full quality scan. It uses a separate lock from per-file store writes,
+// so SaveReport can still take its normal store lock while the scan is held.
+// Non-blocking acquisition makes a manual run fail closed instead of waiting
+// behind a daemon that may be probing a node for several minutes.
+func (s *Store) withScanRunLock(fn func() error) error {
+	if s == nil || s.root == "" || s.root == "." {
+		return ErrInvalidStore
+	}
+	if s.initErr != nil {
+		return s.initErr
+	}
+	if err := s.ensureLayout(); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(s.ScanRunLockPath(), os.O_CREATE|os.O_RDWR, storageFileMode)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := lock.Chmod(storageFileMode); err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return ErrScanBusy
+		}
+		return err
+	}
+	defer syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+	return fn()
+}
+
+// WithRecommendationsLock serializes the read/derive/write transaction used
+// to rebuild recommendations. It is separate from the scan lifecycle lock so
+// the hourly read-only summary can update recommendations while a full scan
+// is collecting evidence, without allowing stale snapshots to overwrite one
+// another across processes.
+func (s *Store) WithRecommendationsLock(fn func() error) error {
+	if s == nil || s.root == "" || s.root == "." {
+		return ErrInvalidStore
+	}
+	if s.initErr != nil {
+		return s.initErr
+	}
+	if err := s.ensureLayout(); err != nil {
+		return err
+	}
+	lock, err := os.OpenFile(s.RecommendationsLockPath(), os.O_CREATE|os.O_RDWR, storageFileMode)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := lock.Chmod(storageFileMode); err != nil {
+		return err
+	}
 	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
 		return err
 	}
@@ -359,8 +428,105 @@ func (s *Store) ListReports(key NodeKey) ([]Report, error) {
 }
 
 func (s *Store) SaveStability(snapshot StabilitySnapshot) error {
-	if err := snapshot.Identity.Validate(); err != nil {
+	var err error
+	snapshot, err = normalizeStabilitySnapshot(snapshot)
+	if err != nil {
 		return err
+	}
+	return s.withLock(func() error {
+		return s.saveStabilityLocked(snapshot)
+	})
+}
+
+// ApplyStability persists a snapshot and refreshes only an already-known
+// node's latest report. It never creates a NodeRecord, which prevents an
+// hourly history summary from inventing an IP identity or baseline.
+func (s *Store) ApplyStability(key NodeKey, snapshot StabilitySnapshot, providerAlive bool, minimumConfidence int) (NodeRecord, error) {
+	if err := key.Validate(); err != nil {
+		return NodeRecord{}, err
+	}
+	key = key.Canonical()
+	var err error
+	snapshot, err = normalizeStabilitySnapshot(snapshot)
+	if err != nil {
+		return NodeRecord{}, err
+	}
+	if snapshot.Identity.ID() != key.ID() {
+		return NodeRecord{}, fmt.Errorf("%w: stability identity does not match node identity", ErrInvalidReport)
+	}
+	if minimumConfidence <= 0 {
+		minimumConfidence = 70
+	}
+	var result NodeRecord
+	err = s.withLock(func() error {
+		var record NodeRecord
+		exists, err := readJSON(s.nodePath(key), &record)
+		if err != nil {
+			return err
+		}
+		if !exists || record.Identity.ID() != key.ID() || record.Latest == nil {
+			return ErrNotFound
+		}
+
+		latest := *record.Latest
+		latest.Identity = key
+		latest.ProviderAlive = providerAlive
+		latest.Provider.Alive = providerAlive
+		latest.Provider.CheckedAt = snapshot.ObservedAt
+		latest.ProviderHistoryFresh = snapshot.Fresh
+		latest.Provider.HistoryFresh = snapshot.Fresh
+		latest.ProviderHistorySamples = snapshot.Samples
+		latest.Provider.HistorySamples = snapshot.Samples
+		latest.ProviderLastSampleAt = snapshot.LastSampleAt
+		latest.Provider.LastSampleAt = snapshot.LastSampleAt
+		latest.StabilityScore = clampScore(snapshot.StabilityScore)
+		latest.StabilityObservedAt = snapshot.ObservedAt
+
+		quality := ScoreQuality(latest.VendorResults, latest.SourceEvidence, latest.RiskEvidence)
+		latest.QualityScore = quality.Score
+		latest.ConfidencePercent = quality.Confidence
+		latest.Complete = quality.Complete && providerAlive && snapshot.Known && snapshot.Fresh
+		latest.Eligible = latest.Complete && latest.ConfidencePercent >= minimumConfidence
+		latest.EffectiveScore = EffectiveScore(latest.QualityScore, latest.StabilityScore)
+		latest.Errors = stabilityErrors(latest.Errors, providerAlive, snapshot, latest.Identity.Provider)
+
+		record.Latest = &latest
+		if record.Best == nil || latest.EffectiveScore > record.BestScore {
+			best := latest
+			record.Best = &best
+			record.BestScore = latest.EffectiveScore
+		}
+		if latest.Eligible {
+			lastGood := latest
+			record.LastGood = &lastGood
+		}
+		record.UpdatedAt = snapshot.ObservedAt
+		if err := writeJSONAtomic(s.nodePath(key), record); err != nil {
+			return err
+		}
+		if err := s.saveStabilityLocked(snapshot); err != nil {
+			return err
+		}
+
+		var targetLatest Report
+		latestExists, err := readJSON(s.latestPath(key.Target), &targetLatest)
+		if err != nil {
+			return err
+		}
+		if latestExists && targetLatest.Identity.ID() == key.ID() {
+			if err := writeJSONAtomic(s.latestPath(key.Target), latest); err != nil {
+				return err
+			}
+		}
+		result = record
+		return nil
+	})
+	return result, err
+}
+
+func normalizeStabilitySnapshot(snapshot StabilitySnapshot) (StabilitySnapshot, error) {
+	if err := snapshot.Identity.Validate(); err != nil {
+		return StabilitySnapshot{}, err
 	}
 	snapshot.Identity = snapshot.Identity.Canonical()
 	if snapshot.ObservedAt.IsZero() {
@@ -368,17 +534,36 @@ func (s *Store) SaveStability(snapshot StabilitySnapshot) error {
 	} else {
 		snapshot.ObservedAt = snapshot.ObservedAt.UTC()
 	}
-	return s.withLock(func() error {
-		snapshots, err := s.readStabilityMap()
-		if err != nil {
-			return err
+	return snapshot, nil
+}
+
+func (s *Store) saveStabilityLocked(snapshot StabilitySnapshot) error {
+	snapshots, err := s.readStabilityMap()
+	if err != nil {
+		return err
+	}
+	snapshots[snapshot.Identity.ID()] = snapshot
+	if err := writeJSONAtomic(filepath.Join(s.root, stabilityFile), snapshots); err != nil {
+		return err
+	}
+	return s.appendStabilityHistory(snapshot)
+}
+
+func stabilityErrors(existing []ReportError, providerAlive bool, snapshot StabilitySnapshot, provider string) []ReportError {
+	result := make([]ReportError, 0, len(existing)+2)
+	for _, item := range existing {
+		if item.Code == ErrorProviderUnhealthy || item.Code == ErrorStabilityUnknown {
+			continue
 		}
-		snapshots[snapshot.Identity.ID()] = snapshot
-		if err := writeJSONAtomic(filepath.Join(s.root, stabilityFile), snapshots); err != nil {
-			return err
-		}
-		return s.appendStabilityHistory(snapshot)
-	})
+		result = append(result, item)
+	}
+	if !providerAlive {
+		result = append(result, ReportError{Code: ErrorProviderUnhealthy, Source: provider, Message: "mihomo provider node is not alive", ObservedAt: snapshot.ObservedAt})
+	}
+	if !snapshot.Known || !snapshot.Fresh {
+		result = append(result, ReportError{Code: ErrorStabilityUnknown, Source: provider, Message: "mihomo history is missing, stale, or insufficient", ObservedAt: snapshot.ObservedAt})
+	}
+	return result
 }
 
 func (s *Store) LoadStability() (map[string]StabilitySnapshot, error) {

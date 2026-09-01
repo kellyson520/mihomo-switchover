@@ -60,12 +60,15 @@ func GenerateRecommendation(report Report, record NodeRecord, target config.Qual
 	if strings.TrimSpace(target.ID) == "" || key.Target != target.ID {
 		return Recommendation{}, fmt.Errorf("%w: target %q does not match report identity", ErrRecommendationMismatch, target.ID)
 	}
-	if target.SourceGroup == "" || target.Provider == "" {
-		return Recommendation{}, fmt.Errorf("%w: target source group and provider are required", ErrRecommendationInvalid)
+	if target.SourceGroup == "" {
+		return Recommendation{}, fmt.Errorf("%w: target source group is required", ErrRecommendationInvalid)
 	}
-	if key.Provider != target.Provider {
+	if target.Provider != "" && key.Provider != target.Provider {
 		return Recommendation{}, fmt.Errorf("%w: provider %q does not match target provider %q", ErrRecommendationMismatch, key.Provider, target.Provider)
 	}
+	provider := firstNonEmpty(key.Provider, target.Provider)
+	provider = firstNonEmpty(provider, target.SourceGroup)
+	key.Provider = provider
 	if key.Node == "" {
 		return Recommendation{}, fmt.Errorf("%w: node is empty", ErrRecommendationInvalid)
 	}
@@ -76,6 +79,9 @@ func GenerateRecommendation(report Report, record NodeRecord, target config.Qual
 		now = now.UTC()
 	}
 	reportedAt := report.ObservedAt.UTC()
+	if report.StabilityObservedAt.After(reportedAt) {
+		reportedAt = report.StabilityObservedAt.UTC()
+	}
 	if reportedAt.IsZero() {
 		reportedAt = now
 	}
@@ -91,7 +97,7 @@ func GenerateRecommendation(report Report, record NodeRecord, target config.Qual
 		ID:                   key.ID(),
 		Target:               target.ID,
 		SourceGroup:          target.SourceGroup,
-		Provider:             target.Provider,
+		Provider:             provider,
 		Node:                 key.Node,
 		Identity:             key,
 		ReportedAt:           reportedAt,

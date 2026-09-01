@@ -10,9 +10,9 @@ func floatPtr(v float64) *float64 { return &v }
 
 func TestScoreQualityTreatsAuthAndRateLimitAsReachable(t *testing.T) {
 	got := ScoreQuality(map[string]VendorResult{
-		"openai":    {Vendor: "openai", StatusCodes: []int{401}, Attempts: 2},
-		"gemini":    {Vendor: "gemini", StatusCodes: []int{403}, Attempts: 2},
-		"anthropic": {Vendor: "anthropic", StatusCodes: []int{429}, Attempts: 2},
+		"openai":    {Vendor: "openai", StatusCodes: []int{401}, SuccessCount: 1, Attempts: 2},
+		"gemini":    {Vendor: "gemini", StatusCodes: []int{403}, SuccessCount: 1, Attempts: 2},
+		"anthropic": {Vendor: "anthropic", StatusCodes: []int{429}, SuccessCount: 1, Attempts: 2},
 	}, nil, nil)
 
 	if got.VendorReachability != 100 {
@@ -77,6 +77,16 @@ func TestScoreIdentityDeduplicatesSourcesAndRequiresStrictMajority(t *testing.T)
 	}
 }
 
+func TestScoreIdentityNormalizesEquivalentSourceURLs(t *testing.T) {
+	got := ScoreIdentity([]SourceEvidence{
+		{Source: "source-a", URL: "https://EXAMPLE.test:443/ip?b=2&a=1#one", Available: true, IP: "203.0.113.10"},
+		{Source: "source-b", URL: "https://example.test/ip?a=1&b=2#two", Available: true, IP: "203.0.113.10"},
+	})
+	if got.Available != 1 || got.Complete {
+		t.Fatalf("identity=%+v, equivalent endpoints must not manufacture independent consensus", got)
+	}
+}
+
 func TestScoreRiskUsesSourceMajority(t *testing.T) {
 	clean := []SourceEvidence{
 		{Source: "risk-a", Kind: "risk", Available: true, Proxy: boolPtr(false), VPN: boolPtr(false), Tor: boolPtr(false), Blacklisted: boolPtr(false)},
@@ -111,12 +121,21 @@ func TestScoreRiskIncludesAbuseAndBlacklistFlags(t *testing.T) {
 
 func TestScoreQualityLowersConfidenceWhenSourcesAreMissing(t *testing.T) {
 	got := ScoreQuality(
-		map[string]VendorResult{"openai": {Vendor: "openai", StatusCodes: []int{200}, Attempts: 2}},
+		map[string]VendorResult{"openai": {Vendor: "openai", StatusCodes: []int{200}, SuccessCount: 1, Attempts: 2}},
 		[]SourceEvidence{{Source: "only-ip", Kind: "ip", Available: true, IP: "203.0.113.10"}},
 		nil,
 	)
 	if got.Confidence >= 100 || got.Complete {
 		t.Fatalf("quality=%+v, want incomplete lower-confidence result", got)
+	}
+}
+
+func TestScoreQualityDoesNotTrustStatusWhenVendorBodyReadFailed(t *testing.T) {
+	got := ScoreQuality(map[string]VendorResult{
+		"openai": {Vendor: "openai", StatusCodes: []int{200, 200}, SuccessCount: 0, Attempts: 2},
+	}, nil, nil)
+	if got.VendorReachability != 0 {
+		t.Fatalf("quality=%+v, body-read failures must not be reachable", got)
 	}
 }
 
@@ -133,8 +152,8 @@ func TestScoreQualityCapsIncompleteEvidenceInsteadOfNormalizingToAHighScore(t *t
 
 func TestScoreReportRecordsCompleteAndEligibleSeparately(t *testing.T) {
 	vendors := map[string]VendorResult{
-		"openai": {Vendor: "openai", StatusCodes: []int{200}, Attempts: 2},
-		"gemini": {Vendor: "gemini", StatusCodes: []int{401}, Attempts: 2},
+		"openai": {Vendor: "openai", StatusCodes: []int{200}, SuccessCount: 1, Attempts: 2},
+		"gemini": {Vendor: "gemini", StatusCodes: []int{401}, SuccessCount: 1, Attempts: 2},
 	}
 	complete := ScoreReport(Report{
 		Complete:      true,

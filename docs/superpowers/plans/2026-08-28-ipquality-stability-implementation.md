@@ -279,6 +279,7 @@ Expected: all recommendation and runtime safety tests pass.
 
 Files:
 - Modify: cmd/guardian/main.go
+- Create: internal/quality/stability_summary.go
 - Modify: deploy/start-guardian.sh
 - Test: cmd/guardian/main_test.go
 - Modify: tests/test_launcher.py
@@ -306,9 +307,14 @@ Commands:
 
 Use the existing direct mihomo API client and secret handling. Return a quality-link error on local API loss so only the quality supervisor restarts the daemon. Baseline reset requires exact target/node/IP identity, preserves old history, and emits an audit event.
 
-- [ ] Step 4: Add a separate quality loop.
+- [ ] Step 4: Add a separate quality loop and hourly stability cadence.
 
 Start and wait for quality-daemon independently. Each loop retries only its own child after one second. The quality loop never signals mihomo. On launcher TERM/INT clean up both child loops; when mihomo exits, stop both loops and exit with mihomo status. Keep guardian-only restart behavior unchanged.
+
+Inside quality-daemon, run the read-only `StabilitySummarizer` at
+`quality.stability.summary_interval` and the public evidence scanner at
+`quality.full_scan_interval`; the summary must not call `SetProxy` or `/delay`, must refresh
+only existing IP identities, and must rebuild recommendations from the refreshed latest data.
 
 - [ ] Step 5: Run tests and commit.
 

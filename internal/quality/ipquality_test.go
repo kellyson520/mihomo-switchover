@@ -140,6 +140,32 @@ func TestParseJSONEvidenceRejectsTrailingGarbage(t *testing.T) {
 	}
 }
 
+func TestParseJSONEvidenceRejectsMalformedExplicitIPEvenWithOtherFields(t *testing.T) {
+	var evidence SourceEvidence
+	err := parseJSONEvidence(&evidence, []byte(`{"ip":"not-an-ip","country":"US"}`))
+	if err == nil || !strings.Contains(err.Error(), "invalid IP") {
+		t.Fatalf("error=%v, malformed explicit IP must fail closed", err)
+	}
+}
+
+func TestCollectorDoesNotCountVendorWhenResponseBodyReadFails(t *testing.T) {
+	const vendorURL = "https://openai.example/partial"
+	client := &fakeExternalFetcher{responses: map[string][]fakeFetchResponse{
+		vendorURL: {{result: probe.Result{Class: probe.ReachableHTTP, Status: 200, Err: "unexpected EOF"}, body: "partial"}},
+	}}
+	got, err := (&Collector{
+		client:  client,
+		Vendors: []VendorProbeSpec{{Vendor: "openai", URL: vendorURL}},
+	}).Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := got.VendorResults["openai"]
+	if result.SuccessCount != 0 || result.Reachable {
+		t.Fatalf("vendor=%+v, body read error must not be counted as reachable", result)
+	}
+}
+
 func TestParseJSONEvidencePrefersTopLevelFieldsDeterministically(t *testing.T) {
 	const body = `{"meta":{"ip":"198.51.100.20","country":"CN"},"ip":"203.0.113.10","country":"US"}`
 	for attempt := 0; attempt < 100; attempt++ {

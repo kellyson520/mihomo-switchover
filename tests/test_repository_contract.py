@@ -27,6 +27,9 @@ def test_configuration_guide_covers_safe_single_file_operations():
         "mihomo.proxy",
         "200–499",
         "providers/proxies",
+        "minimum_coverage_percent",
+        "purity.sources",
+        "baseline",
     )
     for marker in required:
         assert marker in text, marker
@@ -62,3 +65,38 @@ def test_readme_links_to_new_operator_documents():
     text = _read("README.md")
     assert "docs/configuration.md" in text
     assert "skills/mihomo-guardian-production/SKILL.md" in text
+
+
+def test_installer_and_rollback_preserve_quality_state_and_logs():
+    installer = _read("scripts/install.sh")
+    rollback = _read("scripts/rollback.sh")
+    for marker in (
+        "quality-store",
+        "quality.jsonl",
+        "quality_store_present",
+        "quality_log_present",
+    ):
+        assert marker in installer, marker
+    for marker in (
+        "rollback-preserved-",
+        "quality-store",
+        "quality history/logs were retained",
+    ):
+        assert marker in rollback, marker
+
+
+def test_quality_cli_and_status_are_documented_without_secret_output():
+    readme = _read("README.md")
+    skill = _read("skills/mihomo-guardian-production/SKILL.md")
+    main = _read("cmd/guardian/main.go")
+    for marker in (
+        "quality run",
+        "quality status",
+        "quality baseline-reset",
+        "daemon_running",
+        "latest_quality_score",
+    ):
+        assert marker in main, marker
+    for marker in ("quality status", "baseline-reset", "minimum_coverage_percent", "quality.jsonl"):
+        assert marker in skill, marker
+    assert "quality" in readme

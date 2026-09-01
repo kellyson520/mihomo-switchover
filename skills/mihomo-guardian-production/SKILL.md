@@ -73,6 +73,17 @@ docker exec mihomo-cliproxy /guardian/bin/guardian probe \
 sudo ./scripts/status.sh --read-only
 ```
 
+### 公网探测频率
+
+`decision.interval` 是 guardian 主循环周期，默认 `15s`；`decision.probe_interval` 是
+OpenAI、Gemini 等公网厂商以及纯净度查询的最短刷新间隔，默认 `5m`。同一渠道/节点在
+缓存期间不重复访问公网，切换到新节点会立即生成一次新样本。连续失败计数只对新样本
+递增，因此不会把缓存中的同一次失败误判为多次故障。
+
+生产建议保持 `probe_interval: 5m` 或更长，并通过 mihomo provider 的 `alive` 和
+history 判断节点候选；不要把 `decision.interval` 改成 5 分钟来代替它，否则会同时拖慢
+主备决策循环。修改后按上面的 `reload` 流程校验，先在 `observe` 模式观察日志。
+
 ### Quality 目标配置
 
 `quality` 是同一份 `guardian.yaml` 中的可选配置。旧部署可省略它，或保持
@@ -113,6 +124,35 @@ quality:
 `config_reload_failed`。质量配置解析失败时继续使用上一份有效配置，不会停止 mihomo；
 listener、隔离质量组等基础设施字段由安装器管理，不能仅靠手工改 URL 让它们生效。
 
+质量运维命令（均在 mihomo 容器内执行）为：
+
+```sh
+/guardian/bin/guardian quality status \
+  --config /guardian/guardian.yaml --data /guardian/data
+/guardian/bin/guardian quality run \
+  --config /guardian/guardian.yaml --data /guardian/data \
+  --logs /guardian/logs --secret-file /guardian/controller_secret
+/guardian/bin/guardian quality run --target TARGET_ID \
+  --config /guardian/guardian.yaml --data /guardian/data \
+  --logs /guardian/logs --secret-file /guardian/controller_secret
+/guardian/bin/guardian quality baseline-reset \
+  --config /guardian/guardian.yaml --data /guardian/data \
+  --target TARGET_ID --node NODE_NAME --ip EXIT_IP
+```
+
+`quality status` 是只读命令，会显示 daemon、listener、扫描游标、报告数量、baseline
+数量和最新质量/稳定性/综合分；不会打印 secret、订阅 URL、账号或请求凭证。`quality
+run` 失败时不会停止 mihomo；daemon 由 launcher 独立监管。`baseline-reset` 只接受
+target、精确节点名和合法 IP，保留旧报告并写入质量审计记录；不得把它当作常规换节点
+手段。
+
+质量评分规则：综合分 = 质量分 70% + 稳定性分 30%；稳定性内部是可用率 50%、P50
+延迟 30%、抖动/峰值 20%，并按 coverage 折减。默认要求至少 3 个样本、
+`minimum_coverage_percent: 10` 的 history
+覆盖率且样本新鲜；不足时报告为 unknown/incomplete。IP/identity 与风险来源必须使用
+显式稳定 ID，等价 URL 会去重。后续分数上涨只更新 latest/best，不提高 baseline；相对
+初始 baseline 下降至少 20 分才解除 sticky。
+
 质量扫描按 `quality.order` 固定顺序运行；mihomo 原生健康检测继续提供 provider
 health，guardian 每小时汇总已有延迟 history。首次完整有效报告建立不可变的
 `baseline_score`；后续分数上涨只更新 latest/best/历史，不自动改 baseline 或替换当前
@@ -120,7 +160,15 @@ health，guardian 每小时汇总已有延迟 history。首次完整有效报告
 旧身份历史保留。默认只有相对初始 baseline 下降至少 20 分才解除粘性，并且仍需通过
 连通性、provider history、IP 一致性和置信度复核。
 
-可热重载：`decision.mode`、决策阈值/周期/保持时间、`probes`、`purity`、
+稳定性汇总是质量 daemon 的独立只读阶段：它只读取 provider 已有 history，不调用
+`/delay`、不发起公网请求、不调用 `SetProxy`。它按 `quality.order` 和每个 target 的
+`scope/node_filter` 遍历，只有已有完整 IP 身份的节点才更新 `stability.json`、
+`stability-history.jsonl` 和 latest 推荐输入；未建身份的节点等待下一次全量扫描，不会
+生成无 IP 记录。`quality status` 的 `latest_stability_at` 用来区分小时汇总时间和全量
+质量报告时间。汇总失败会记入 `quality_stability_summary_failed` 并按更短周期重试；
+失去 mihomo 心跳只重启质量子进程，不停止 mihomo 或实时 guardian。
+
+可热重载：`decision.mode`、决策阈值/周期/保持时间、`decision.probe_interval`、`probes`、`purity`、
 `quality`（目标顺序、阈值、周期、保留期）、`reload.check_interval`。需要重启 guardian：`mihomo` 连接端点、secret 路径、组、
 provider、日志配置、`link_loss_grace`、`startup_api_timeout`。静态字段变更后不能
 假定已生效；只重启 guardian 子进程，禁止重启 mihomo。
@@ -156,7 +204,8 @@ docker exec mihomo-cliproxy /guardian/bin/guardian auto \
 ```
 
 不要在 `observe` 验收前启用自动切换。安装器会备份 Compose、mihomo 配置、旧切换器、
-状态和 guardian 配置；预检失败时不得继续写入。
+状态、guardian 配置、质量 store（reports、baselines、scan progress、audit）和
+`quality.jsonl`；预检失败时不得继续写入。
 
 ## 验收清单
 
@@ -206,6 +255,8 @@ sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
 
 此回滚会重建 Compose 服务，可能短暂重启 mihomo，必须确认维护窗口；它是受控回滚路径，
 不能用 `docker compose down` 替代。回滚后再次执行只读状态和完整验收。
+回滚会先把当前质量 store 和质量日志保存到 `backups/rollback-preserved-*`，然后恢复
+部署文件；不会删除或覆盖当前质量历史，便于排查回滚前后的分数变化。
 
 ## 常见错误
 

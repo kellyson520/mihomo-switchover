@@ -26,13 +26,20 @@ var (
 	ErrScanner     = errors.New("quality scanner error")
 )
 
-// MihomoAPI is the deliberately small control-plane surface used by the
-// scanner. In particular, SetProxy is only ever called with a generated
-// GUARDIAN-QUALITY-* group; source groups and CHANNEL remain read-only here.
-type MihomoAPI interface {
+// ReadOnlyMihomoAPI is the control-plane surface used by stability summaries.
+// It intentionally has no selection method, so an hourly summary cannot
+// change production or generated groups even if its caller is misconfigured.
+type ReadOnlyMihomoAPI interface {
 	Heartbeat(context.Context) error
 	GetProxy(context.Context, string) (mihomo.Proxy, error)
 	GetProvider(context.Context, string) (mihomo.Provider, error)
+}
+
+// MihomoAPI is the scanner surface. SetProxy is only ever called with a
+// generated GUARDIAN-QUALITY-* group; source groups and CHANNEL remain
+// read-only here.
+type MihomoAPI interface {
+	ReadOnlyMihomoAPI
 	SetProxy(context.Context, string, string) error
 }
 
@@ -65,6 +72,10 @@ type Scanner struct {
 	// out of the public configuration so scan timestamps remain operational
 	// data rather than behavior configuration.
 	Now func() time.Time
+
+	// Force bypasses the scheduled full-scan gate for an operator-invoked
+	// quality run. The daemon leaves it false and follows FullScanInterval.
+	Force bool
 }
 
 type scanCandidate struct {
@@ -79,6 +90,15 @@ type scanCandidate struct {
 // different: it is returned immediately and no selection or external client
 // is created.
 func (s *Scanner) Scan(ctx context.Context, cfg config.Config) error {
+	if s == nil || s.Reports == nil {
+		return fmt.Errorf("%w: report store is missing", ErrScanner)
+	}
+	return s.Reports.withScanRunLock(func() error {
+		return s.scan(ctx, cfg)
+	})
+}
+
+func (s *Scanner) scan(ctx context.Context, cfg config.Config) error {
 	if err := s.heartbeat(ctx); err != nil {
 		return err
 	}
@@ -118,6 +138,15 @@ func (s *Scanner) Scan(ctx context.Context, cfg config.Config) error {
 // heartbeats first so a caller cannot accidentally select a quality node or
 // construct a public client while mihomo is disconnected.
 func (s *Scanner) ScanTarget(ctx context.Context, cfg config.Config, target config.QualityTarget) error {
+	if s == nil || s.Reports == nil {
+		return fmt.Errorf("%w: report store is missing", ErrScanner)
+	}
+	return s.Reports.withScanRunLock(func() error {
+		return s.scanTargetEntry(ctx, cfg, target)
+	})
+}
+
+func (s *Scanner) scanTargetEntry(ctx context.Context, cfg config.Config, target config.QualityTarget) error {
 	if err := s.heartbeat(ctx); err != nil {
 		return err
 	}
@@ -160,11 +189,23 @@ func (s *Scanner) scanTarget(ctx context.Context, cfg config.Config, target conf
 		progress.Targets = make(map[string]TargetScanProgress)
 	}
 	targetProgress := progress.Targets[target.ID]
+	now := s.now()
 	if targetProgress.Target == target.ID &&
 		targetProgress.Provider == target.Provider &&
 		targetProgress.ProviderFingerprint == fingerprint &&
-		targetProgress.Complete {
+		targetProgress.Complete && targetProgress.Failed == 0 &&
+		!s.Force && !targetProgress.LastFullScanAt.IsZero() &&
+		now.Before(targetProgress.LastFullScanAt.Add(fullScanInterval(cfg))) {
 		return nil
+	}
+	if targetProgress.Failed > 0 || s.Force ||
+		(targetProgress.Complete && (targetProgress.LastFullScanAt.IsZero() || !now.Before(targetProgress.LastFullScanAt.Add(fullScanInterval(cfg))))) {
+		targetProgress.Cursor = ""
+		targetProgress.CursorIndex = 0
+		targetProgress.Attempted = 0
+		targetProgress.Completed = 0
+		targetProgress.Failed = 0
+		targetProgress.Complete = false
 	}
 	if targetProgress.Target != target.ID || targetProgress.Provider != target.Provider || targetProgress.ProviderFingerprint != fingerprint {
 		targetProgress = TargetScanProgress{Target: target.ID, Provider: target.Provider, ProviderFingerprint: fingerprint}
@@ -186,8 +227,6 @@ func (s *Scanner) scanTarget(ctx context.Context, cfg config.Config, target conf
 		targetProgress.Target = target.ID
 		targetProgress.Provider = target.Provider
 		targetProgress.ProviderFingerprint = fingerprint
-		targetProgress.Cursor = candidate.name
-		targetProgress.CursorIndex = index
 		targetProgress.LastAttemptAt = now
 		targetProgress.Complete = false
 		if err := s.saveTargetProgress(&progress, targetProgress); err != nil {
@@ -209,8 +248,14 @@ func (s *Scanner) scanTarget(ctx context.Context, cfg config.Config, target conf
 		if success {
 			targetProgress.Completed++
 			targetProgress.LastSuccessAt = targetProgress.LastAttemptAt
+			targetProgress.Cursor = candidate.name
+			targetProgress.CursorIndex = index + 1
+		} else {
+			targetProgress.Failed++
+			// Cursor denotes the last completed node. Leaving it unchanged makes
+			// a crash before the next checkpoint retry this node.
 		}
-		targetProgress.Complete = index+1 >= len(candidates)
+		targetProgress.Complete = index+1 >= len(candidates) && targetProgress.Failed == 0
 		if err := s.saveTargetProgress(&progress, targetProgress); err != nil {
 			return fmt.Errorf("%w: save scan progress after node %q: %v", ErrScanner, candidate.name, err)
 		}
@@ -219,8 +264,11 @@ func (s *Scanner) scanTarget(ctx context.Context, cfg config.Config, target conf
 		}
 	}
 
-	targetProgress.CursorIndex = len(candidates)
-	targetProgress.Complete = true
+	if targetProgress.Failed == 0 {
+		targetProgress.CursorIndex = len(candidates)
+		targetProgress.Complete = true
+		targetProgress.LastFullScanAt = s.now()
+	}
 	if err := s.saveTargetProgress(&progress, targetProgress); err != nil {
 		return fmt.Errorf("%w: save completed scan progress for target %q: %v", ErrScanner, target.ID, err)
 	}
@@ -231,23 +279,28 @@ func (s *Scanner) scanTarget(ctx context.Context, cfg config.Config, target conf
 }
 
 func (s *Scanner) resolveCandidates(ctx context.Context, target config.QualityTarget) ([]scanCandidate, error) {
-	if s.API == nil {
+	return resolveQualityCandidates(ctx, s.API, s.State, target)
+}
+
+func resolveQualityCandidates(ctx context.Context, api ReadOnlyMihomoAPI, guardianState *state.Store, target config.QualityTarget) ([]scanCandidate, error) {
+	if api == nil {
 		return nil, fmt.Errorf("%w: API dependency is missing", ErrScanner)
 	}
 	sourceGroup := target.SourceGroup
 	if strings.TrimSpace(sourceGroup) == "" {
 		return nil, fmt.Errorf("%w: target %q source group is empty", ErrScanner, target.ID)
 	}
-	group, err := s.API.GetProxy(ctx, sourceGroup)
+	group, err := api.GetProxy(ctx, sourceGroup)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read source group %q: %v", ErrScanner, sourceGroup, err)
 	}
 
 	providerNodes := make(map[string]mihomo.Proxy)
+	providerOrder := make([]string, 0)
 	providerConfigured := strings.TrimSpace(target.Provider) != ""
 	if providerConfigured {
 		providerName := target.Provider
-		provider, err := s.API.GetProvider(ctx, providerName)
+		provider, err := api.GetProvider(ctx, providerName)
 		if err != nil {
 			return nil, fmt.Errorf("%w: read provider %q: %v", ErrScanner, providerName, err)
 		}
@@ -258,6 +311,7 @@ func (s *Scanner) resolveCandidates(ctx context.Context, target config.QualityTa
 			}
 			if _, exists := providerNodes[name]; !exists {
 				providerNodes[name] = node
+				providerOrder = append(providerOrder, name)
 			}
 		}
 	}
@@ -267,15 +321,20 @@ func (s *Scanner) resolveCandidates(ctx context.Context, target config.QualityTa
 		return nil, fmt.Errorf("%w: target %q node_filter: %v", ErrScanner, target.ID, err)
 	}
 
-	// mihomo's source group order is authoritative for the intersection. It
-	// is the order users see and select in that group; provider metadata only
-	// supplies membership and health/history, never extra nodes.
+	// For provider-backed targets, provider order is authoritative and the
+	// source group acts as a membership boundary. This preserves the provider's
+	// stable ordering while preventing nodes outside the configured group from
+	// being scanned.
 	sourceNodes := orderedUnique(group.All)
+	sourceSet := make(map[string]struct{}, len(sourceNodes))
+	for _, node := range sourceNodes {
+		sourceSet[node] = struct{}{}
+	}
 	if target.Scope == "locked" {
-		if s.State == nil {
+		if guardianState == nil {
 			return nil, fmt.Errorf("%w: target %q requires guardian state for locked scope", ErrScanner, target.ID)
 		}
-		stored, err := s.State.Load()
+		stored, err := guardianState.Load()
 		if err != nil {
 			return nil, fmt.Errorf("%w: load guardian state for target %q: %v", ErrScanner, target.ID, err)
 		}
@@ -286,6 +345,9 @@ func (s *Scanner) resolveCandidates(ctx context.Context, target config.QualityTa
 		for _, node := range sourceNodes {
 			if node != lock.Node {
 				continue
+			}
+			if filter != nil && !filter.MatchString(node) {
+				return nil, fmt.Errorf("%w: locked node %q is excluded by target %q node_filter", ErrScanner, node, target.ID)
 			}
 			if providerConfigured {
 				providerNode, exists := providerNodes[node]
@@ -302,8 +364,18 @@ func (s *Scanner) resolveCandidates(ctx context.Context, target config.QualityTa
 		return nil, fmt.Errorf("%w: target %q scope must be locked or all", ErrScanner, target.ID)
 	}
 
-	candidates := make([]scanCandidate, 0, len(sourceNodes))
-	for _, node := range sourceNodes {
+	candidateNames := sourceNodes
+	if providerConfigured {
+		candidateNames = make([]string, 0, len(providerOrder))
+		for _, name := range providerOrder {
+			if _, exists := sourceSet[name]; exists {
+				candidateNames = append(candidateNames, name)
+			}
+		}
+		candidateNames = orderedUnique(candidateNames)
+	}
+	candidates := make([]scanCandidate, 0, len(candidateNames))
+	for _, node := range candidateNames {
 		if filter != nil && !filter.MatchString(node) {
 			continue
 		}
@@ -316,6 +388,9 @@ func (s *Scanner) resolveCandidates(ctx context.Context, target config.QualityTa
 			continue
 		}
 		candidates = append(candidates, scanCandidate{name: node})
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("%w: target %q has no candidates after source/provider/filter intersection", ErrScanner, target.ID)
 	}
 	return candidates, nil
 }
@@ -356,6 +431,11 @@ func scannerCandidateFingerprint(names []string) string {
 }
 
 func resumeIndex(progress TargetScanProgress, names []string) int {
+	if progress.CursorIndex == 0 {
+		// A zero index is the durable representation of an in-flight first
+		// node; do not let its display cursor cause that node to be skipped.
+		return 0
+	}
 	if progress.CursorIndex > 0 && progress.CursorIndex <= len(names) {
 		if progress.Cursor == "" || names[progress.CursorIndex-1] == progress.Cursor {
 			return progress.CursorIndex
@@ -461,9 +541,16 @@ func (s *Scanner) scanNode(ctx context.Context, cfg config.Config, target config
 	if _, err := s.Reports.SaveReport(report); err != nil {
 		return false, fmt.Errorf("save report for node %q: %w", candidate.name, err)
 	}
+	if !report.Eligible {
+		s.log("quality_node_unqualified", map[string]any{
+			"target": target.ID, "provider": target.Provider, "node": candidate.name,
+			"effective_score": report.EffectiveScore, "eligible": false,
+		})
+		return false, errors.New("quality report is incomplete or below recommendation confidence")
+	}
 	s.log("quality_node_complete", map[string]any{
 		"target": target.ID, "provider": target.Provider, "node": candidate.name,
-		"effective_score": report.EffectiveScore, "eligible": report.Eligible,
+		"effective_score": report.EffectiveScore, "eligible": true,
 	})
 	return true, nil
 }
@@ -496,10 +583,27 @@ func collectionIdentity(collection Collection) (string, string, bool) {
 }
 
 func scannerSources(cfg config.Config) []SourceSpec {
-	if len(cfg.Purity.URLs) == 0 {
-		return nil
+	result := make([]SourceSpec, 0, len(cfg.Purity.Sources)+len(cfg.Purity.URLs))
+	for _, source := range cfg.Purity.Sources {
+		kind := SourceKind(source.Kind)
+		format := SourceFormat(source.Format)
+		if kind == "" {
+			kind = SourceKindIP
+		}
+		if format == "" {
+			format = SourceFormatText
+		}
+		result = append(result, SourceSpec{
+			ID: source.ID, URL: source.URL, Kind: kind, Format: format,
+			Timeout: cfg.Purity.Timeout, Critical: source.Critical,
+		})
 	}
-	result := make([]SourceSpec, 0, len(cfg.Purity.URLs))
+	if len(cfg.Purity.URLs) == 0 {
+		return result
+	}
+	// urls is retained as a backwards-compatible shorthand for identity/IP
+	// sources. New configurations should use sources so risk endpoints cannot
+	// be guessed from URL spelling.
 	for index, raw := range cfg.Purity.URLs {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
@@ -545,11 +649,20 @@ func (s *Scanner) saveTargetProgress(progress *ScanProgress, target TargetScanPr
 	progress.ProviderFingerprint = target.ProviderFingerprint
 	progress.Attempted = target.Attempted
 	progress.Completed = target.Completed
+	progress.Failed = target.Failed
+	progress.LastFullScanAt = target.LastFullScanAt
 	progress.LastAttemptAt = target.LastAttemptAt
 	progress.LastSuccessAt = target.LastSuccessAt
 	progress.Complete = target.Complete
 	progress.UpdatedAt = s.now()
 	return s.Reports.SaveScanProgress(*progress)
+}
+
+func fullScanInterval(cfg config.Config) time.Duration {
+	if cfg.Quality.FullScanInterval > 0 {
+		return cfg.Quality.FullScanInterval
+	}
+	return 720 * time.Hour
 }
 
 func (s *Scanner) perNodeTimeout(cfg config.Config) time.Duration {

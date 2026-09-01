@@ -3,6 +3,7 @@ package quality
 import (
 	"math"
 	"net"
+	"net/url"
 	"sort"
 	"strings"
 )
@@ -256,8 +257,8 @@ func ScoreRisk(sources []SourceEvidence) RiskScoreResult {
 
 // distinctAvailableEvidence prevents repeated responses from one configured
 // source (or two IDs pointing at the same URL) from manufacturing a majority.
-// Entries without either identity are ignored because they cannot establish
-// independent provenance safely.
+// Entries without an explicit stable source ID are ignored because they cannot
+// establish independent provenance safely.
 func distinctAvailableEvidence(sources []SourceEvidence) []SourceEvidence {
 	result := make([]SourceEvidence, 0, len(sources))
 	seenSources := make(map[string]struct{})
@@ -267,10 +268,10 @@ func distinctAvailableEvidence(sources []SourceEvidence) []SourceEvidence {
 			continue
 		}
 		sourceID := strings.ToLower(strings.TrimSpace(source.Source))
-		sourceURL := strings.TrimSpace(source.URL)
-		if sourceID == "" && sourceURL == "" {
+		if sourceID == "" {
 			continue
 		}
+		sourceURL := normalizeEvidenceURL(source.URL)
 		_, sourceSeen := seenSources[sourceID]
 		_, urlSeen := seenURLs[sourceURL]
 		if (sourceID != "" && sourceSeen) || (sourceURL != "" && urlSeen) {
@@ -287,6 +288,29 @@ func distinctAvailableEvidence(sources []SourceEvidence) []SourceEvidence {
 	return result
 }
 
+func normalizeEvidenceURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed == nil {
+		return strings.ToLower(strings.TrimSpace(raw))
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	host := strings.ToLower(parsed.Hostname())
+	if port := parsed.Port(); port != "" && !(parsed.Scheme == "https" && port == "443") && !(parsed.Scheme == "http" && port == "80") {
+		host = net.JoinHostPort(host, port)
+	}
+	parsed.Host = host
+	parsed.Fragment = ""
+	if parsed.RawQuery != "" {
+		query := parsed.Query()
+		for key, values := range query {
+			sort.Strings(values)
+			query[key] = values
+		}
+		parsed.RawQuery = query.Encode()
+	}
+	return parsed.String()
+}
+
 func scoreVendors(vendors map[string]VendorResult) (score int, complete bool) {
 	if len(vendors) == 0 {
 		return 0, false
@@ -301,6 +325,15 @@ func scoreVendors(vendors map[string]VendorResult) (score int, complete bool) {
 }
 
 func vendorReachable(result VendorResult) bool {
+	// A status code is not enough: the HTTP client can receive a status and
+	// still fail while reading the response body. SuccessCount is incremented
+	// only after the complete response was read successfully.
+	if result.Attempts > 0 {
+		return result.SuccessCount > 0
+	}
+	if result.SuccessCount > 0 {
+		return true
+	}
 	if len(result.StatusCodes) > 0 {
 		for _, status := range result.StatusCodes {
 			if status >= 200 && status < 500 {
@@ -308,11 +341,6 @@ func vendorReachable(result VendorResult) bool {
 			}
 		}
 		return false
-	}
-	for _, status := range result.StatusCodes {
-		if status >= 200 && status < 500 {
-			return true
-		}
 	}
 	return result.Reachable
 }

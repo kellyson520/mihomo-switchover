@@ -47,6 +47,7 @@ quality:
     summary_interval: 1h
     history_window: 24h
     minimum_samples: 3
+    minimum_coverage_percent: 10
     stale_after: 26h
     good_latency_ms: 500
     bad_latency_ms: 3000
@@ -57,6 +58,8 @@ quality:
 decision:
   mode: auto
   interval: 15s
+  # 主循环保持较快；公网厂商探测至少每 5 分钟刷新一次。
+  probe_interval: 5m
   failures_before_switch: 3
   recoveries_before_switch: 2
   min_hold: 120s
@@ -87,6 +90,24 @@ purity:
   urls:
     - https://api.ipify.org
     - https://ipinfo.io/json
+  # New quality deployments should use explicit source metadata. Add at least
+  # two independent risk sources before enabling quality scanning.
+  sources:
+    - id: identity-text
+      url: https://api.ipify.org
+      kind: identity
+      format: text
+      critical: true
+    - id: identity-json
+      url: https://ipinfo.io/json
+      kind: identity
+      format: json
+      critical: true
+    # - id: risk-provider-a
+    #   url: https://YOUR-RISK-SOURCE.example/check
+    #   kind: risk
+    #   format: json
+    #   critical: true
 
 logging:
   max_bytes: 10485760

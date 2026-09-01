@@ -17,6 +17,7 @@ var (
 	ErrInvalidReport  = errors.New("quality: invalid report")
 	ErrInvalidStore   = errors.New("quality: invalid store root")
 	ErrCorruptJSON    = errors.New("quality: corrupt JSON")
+	ErrScanBusy       = errors.New("quality: another full scan is already running")
 )
 
 // CorruptFileError identifies a malformed persistence file and, when
@@ -212,6 +213,7 @@ type Report struct {
 	ProviderHistoryFresh   bool                    `json:"provider_history_fresh"`
 	ProviderHistorySamples int                     `json:"provider_history_samples,omitempty"`
 	ProviderLastSampleAt   time.Time               `json:"provider_last_sample_at,omitempty"`
+	StabilityObservedAt    time.Time               `json:"stability_observed_at,omitempty"`
 	QualityScore           int                     `json:"quality_score"`
 	StabilityScore         int                     `json:"stability_score"`
 	EffectiveScore         int                     `json:"effective_score"`
@@ -236,7 +238,7 @@ func (r Report) Validate() error {
 	return nil
 }
 
-func (r Report) BaselineEligible() bool { return r.Complete }
+func (r Report) BaselineEligible() bool { return r.Complete && r.Eligible }
 
 type Baseline struct {
 	Identity          NodeKey   `json:"identity"`
@@ -288,6 +290,8 @@ type TargetScanProgress struct {
 	ProviderFingerprint string    `json:"provider_fingerprint,omitempty"`
 	Attempted           int       `json:"attempted"`
 	Completed           int       `json:"completed"`
+	Failed              int       `json:"failed"`
+	LastFullScanAt      time.Time `json:"last_full_scan_at,omitempty"`
 	LastAttemptAt       time.Time `json:"last_attempt_at,omitempty"`
 	LastSuccessAt       time.Time `json:"last_success_at,omitempty"`
 	Complete            bool      `json:"complete"`
@@ -301,6 +305,8 @@ type ScanProgress struct {
 	ProviderFingerprint string                        `json:"provider_fingerprint,omitempty"`
 	Attempted           int                           `json:"attempted"`
 	Completed           int                           `json:"completed"`
+	Failed              int                           `json:"failed"`
+	LastFullScanAt      time.Time                     `json:"last_full_scan_at,omitempty"`
 	LastAttemptAt       time.Time                     `json:"last_attempt_at,omitempty"`
 	LastSuccessAt       time.Time                     `json:"last_success_at,omitempty"`
 	Complete            bool                          `json:"complete"`
