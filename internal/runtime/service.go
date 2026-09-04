@@ -332,9 +332,12 @@ func (s *Service) collectCriticalProbes(ctx context.Context, requireAll bool) pr
 			routePolicyFailures++
 		}
 	}
-	healthy := critical > 0 && passed >= s.cfg.Decision.CriticalQuorum
+	// A configured vendor policy rejection is a hard incompatibility for this
+	// node. It must not be hidden by a low quorum (for example OpenAI passing
+	// while Gemini rejects the exit region).
+	healthy := critical > 0 && routePolicyFailures == 0 && passed >= s.cfg.Decision.CriticalQuorum
 	if requireAll {
-		healthy = critical > 0 && passed == critical
+		healthy = critical > 0 && routePolicyFailures == 0 && passed == critical
 	}
 	// An explicit vendor policy rejection is stronger than a generic HTTP
 	// response: it proves this exit cannot serve that vendor.  One such
@@ -449,6 +452,7 @@ func (s *Service) findCompatibleProviderNode(ctx context.Context, provider, grou
 			}
 		}
 		if err := ctx.Err(); err != nil {
+			s.restoreProviderNode(ctx, provider, groupName, currentNode)
 			return "", probeSummary{}, false
 		}
 		if err := s.api.SetProxy(ctx, groupName, node); err != nil {
@@ -468,12 +472,23 @@ func (s *Service) findCompatibleProviderNode(ctx context.Context, provider, grou
 	}
 
 	if currentNode != "" {
-		if err := s.api.SetProxy(ctx, groupName, currentNode); err != nil {
-			s.log("candidate_node_restore_failed", map[string]any{"provider": provider, "group": groupName, "error": err.Error()})
-		}
+		s.restoreProviderNode(ctx, provider, groupName, currentNode)
 	}
 	s.log("compatible_node_not_found", map[string]any{"provider": provider, "group": groupName})
 	return "", probeSummary{}, false
+}
+
+func (s *Service) restoreProviderNode(ctx context.Context, provider, groupName, node string) {
+	if node == "" {
+		return
+	}
+	// Candidate qualification can be canceled after it has already changed the
+	// generated group. Remove cancellation from the compensating write so the
+	// live group is never left on an unqualified node.
+	restoreCtx := context.WithoutCancel(ctx)
+	if err := s.api.SetProxy(restoreCtx, groupName, node); err != nil {
+		s.log("candidate_node_restore_failed", map[string]any{"provider": provider, "group": groupName, "error": err.Error()})
+	}
 }
 
 type mihomoHeartbeater interface {

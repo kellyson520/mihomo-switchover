@@ -118,6 +118,37 @@ func TestExternalClientClassifiesGeminiLocationErrorWithoutLoggingBody(t *testin
 	}
 }
 
+func TestExternalClientTreatsResponseBodyReadFailureAsNetworkFailure(t *testing.T) {
+	client := &ExternalClient{client: &http.Client{
+		Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Body:       failingBodyReader{},
+			}, nil
+		}),
+	}}
+
+	result, _ := client.Fetch(context.Background(), config.ProbeSpec{
+		ID: "body-read", URL: "https://api.example.test/models",
+		ExpectedMin: 200, ExpectedMax: 499,
+	})
+	if result.Class != NetworkError || result.ErrorKind != ErrorKindBodyRead {
+		t.Fatalf("result=%+v, want network body-read failure", result)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type failingBodyReader struct{}
+
+func (failingBodyReader) Read([]byte) (int, error) { return 0, errors.New("body read failed") }
+
+func (failingBodyReader) Close() error { return nil }
+
 func TestClassifyErrorKindPreservesTypedNetworkCategories(t *testing.T) {
 	if got := classifyErrorKind(context.DeadlineExceeded); got != ErrorKindTimeout {
 		t.Fatalf("deadline kind=%s, want timeout", got)

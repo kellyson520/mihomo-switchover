@@ -135,6 +135,20 @@ def _ensure_mounts(lines: list[str], root: Path) -> list[str]:
         end += 1
     existing = lines[volume_index + 1 : end]
 
+    for line in existing:
+        if _indent(line) == 6 and line.strip().startswith("-"):
+            item = line.strip()[1:].strip()
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:\s", item):
+                raise ValueError("long-form volume syntax is unsupported; use short-form mounts")
+
+    for line in existing:
+        target = _volume_target(line)
+        if target not in {"/guardian/bin", "/guardian/bin/guardian"}:
+            continue
+        _, mode = _volume_source_and_mode(line)
+        if mode is not None and "," in mode:
+            raise ValueError("guardian/bin volume mode must not be compound")
+
     directory_indexes = [
         index for index, line in enumerate(existing) if _volume_target(line) == "/guardian/bin"
     ]
@@ -144,6 +158,8 @@ def _ensure_mounts(lines: list[str], root: Path) -> list[str]:
         source, mode = _volume_source_and_mode(existing[directory_indexes[0]])
         if source != str(root / "bin"):
             raise ValueError("guardian/bin mount source conflicts with guardian root")
+        if mode is not None and "," in mode:
+            raise ValueError("guardian/bin volume mode must not be compound")
         if mode != "ro":
             raise ValueError("guardian/bin mount must be read-only")
 
@@ -203,7 +219,7 @@ def _volume_target(line: str) -> str | None:
     parts = value.split(":")
     if len(parts) < 2:
         return None
-    return parts[-2] if len(parts) >= 3 and parts[-1] in {"ro", "rw", "z", "Z"} else parts[-1]
+    return parts[-2] if len(parts) >= 3 and _is_volume_mode(parts[-1]) else parts[-1]
 
 
 def _volume_source_and_mode(line: str) -> tuple[str, str | None]:
@@ -214,9 +230,15 @@ def _volume_source_and_mode(line: str) -> tuple[str, str | None]:
     parts = value.split(":")
     if len(parts) < 2:
         return "", None
-    if len(parts) >= 3 and parts[-1] in {"ro", "rw", "z", "Z"}:
+    if len(parts) >= 3 and _is_volume_mode(parts[-1]):
         return ":".join(parts[:-2]), parts[-1]
     return ":".join(parts[:-1]), None
+
+
+def _is_volume_mode(value: str) -> bool:
+    allowed = {"ro", "rw", "z", "Z", "cached", "delegated", "consistent", "nocopy"}
+    modes = value.split(",")
+    return bool(modes) and all(mode in allowed for mode in modes)
 
 
 def _indent(line: str) -> int:

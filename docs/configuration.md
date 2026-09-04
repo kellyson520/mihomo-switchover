@@ -165,10 +165,11 @@ sudo ./scripts/update-guardian.sh --preflight
 sudo ./scripts/install.sh --migrate-bin-mount --observe
 ```
 
-安装器先备份 Compose、mihomo 配置、guardian 状态和质量数据，再把二进制改成持久化目录
+安装器先备份 Compose、mihomo 配置、guardian 二进制、launcher、controller secret、状态和质量数据，再把二进制改成持久化目录
 挂载 `/opt/mihomo-cliproxy/guardian/bin:/guardian/bin:ro`。这一步可能触发 Compose 服务
 重建，可能短暂重启 Mihomo，因此必须先安排维护窗口并在 `observe` 下验收。预检、Compose
-校验或运行时验收失败时停止继续操作，使用既有备份回滚。
+校验或运行时验收失败时停止继续操作，使用既有备份回滚；任一写入后的异常都会由退出钩子
+尝试完整恢复，回滚失败时必须人工接管，不能重启 Mihomo 盲目补救。
 
 迁移成功后，日常重新注入只执行：
 
@@ -184,6 +185,15 @@ rename；随后只 TERM guardian/quality 子进程，由 launcher 拉起新 guar
 级别重启。更新日志位于 `guardian/logs/guardian-update.jsonl`，不包含 secret、API key、
 订阅 URL 或账号信息。普通日常更新不需要维护窗口，但当前输出仍为 `migration_required=1`
 时不得绕过迁移门禁。
+
+更新验证使用容器内 ps 的 guardian/quality 父子关系，避免把宿主机 PID 交给 `docker exec`；
+随后运行只读 `guardian status` 验证 Mihomo API，并检查 `/proc/net/tcp` 的代理监听是否仍在。
+更新过程持有 `guardian/run/guardian-update.lock`，同一时间只允许一个更新器。任何替换后的
+异常都会尝试按旧 hash 原子恢复；若记录 `update_rollback_failed`，必须暂停自动操作并人工
+核对备份文件，不能重启 Mihomo 作为补救。
+
+Compose 挂载解析目前只接受短语法的单一 mode（例如 `source:/guardian/bin:ro`）；长语法或
+`ro,z` 等复合 mode 会明确拒绝，避免安装器静默生成重复挂载。
 
 ## 字段说明
 
@@ -557,7 +567,18 @@ docker exec mihomo-cliproxy sh -c \
 sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
 ```
 
-该脚本会恢复最近的完整备份并重建目标 Compose 服务，因此属于容器级应急操作，可能
+安装器失败时会把本次创建的 `backup_dir` 传给回滚脚本，避免并发更新时误选另一份备份。
+人工执行时也应从 `guardian/backups/` 选择完整目录并显式传入 `--backup-dir`：
+
+```sh
+sudo ./scripts/rollback.sh \
+  --guardian-root /opt/mihomo-cliproxy/guardian \
+  --backup-dir /opt/mihomo-cliproxy/guardian/backups/UTC-TIMESTAMP-PID
+```
+
+回滚会严格校验 manifest、presence 标记、固定目标路径、备份文件和 guardian 二进制 hash，
+然后先把全部目标文件放入临时事务目录，再逐个原子替换；文件或 Compose 校验失败时会
+尝试恢复回滚前的 host 文件。它会恢复完整备份并重建目标 Compose 服务，因此属于容器级应急操作，可能
 短暂重启 mihomo；执行前确认备份清单和业务维护窗口。它保留 guardian 的日志、状态和
 备份目录，不删除排查证据。不要手工执行 `docker compose down`，不要 force push 或
 删除备份目录。

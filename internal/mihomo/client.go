@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -248,6 +249,9 @@ func (c *Client) do(ctx context.Context, method, path string, body []byte) (int,
 		n, readErr := resp.Body.Read(readBuf)
 		buf = append(buf, readBuf[:n]...)
 		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) {
+				return resp.StatusCode, buf, fmt.Errorf("read mihomo API response: %w", readErr)
+			}
 			break
 		}
 	}

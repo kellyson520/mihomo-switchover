@@ -285,6 +285,10 @@ func (c *ExternalClient) Fetch(ctx context.Context, spec config.ProbeSpec) (Resu
 	result.Class = ClassifyStatus(resp.StatusCode, spec.ExpectedMin, spec.ExpectedMax)
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if readErr != nil {
+		// A status line without a complete body is not reliable vendor
+		// evidence. Treat it as transport failure so the runtime cannot count
+		// a truncated response as a successful critical probe.
+		result.Class = NetworkError
 		result.Cause = readErr
 		result.ErrorKind = ErrorKindBodyRead
 		result.Err = redactError(readErr)

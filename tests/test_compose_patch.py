@@ -71,6 +71,45 @@ def test_patch_rejects_writable_guardian_directory_mount():
         patch_compose(source, "/opt/x/guardian")
 
 
+def test_patch_rejects_long_form_volume_syntax_instead_of_duplicating_mounts():
+    source = """services:
+  mihomo-cliproxy:
+    image: x
+    volumes:
+      - type: bind
+        source: /opt/x/guardian/bin
+        target: /guardian/bin
+        read_only: true
+"""
+
+    with pytest.raises(ValueError, match="long-form volume"):
+        patch_compose(source, "/opt/x/guardian")
+
+
+def test_patch_rejects_compound_guardian_mount_mode():
+    source = """services:
+  mihomo-cliproxy:
+    image: x
+    volumes:
+      - /opt/x/guardian/bin:/guardian/bin:ro,z
+"""
+
+    with pytest.raises(ValueError, match="volume mode"):
+        patch_compose(source, "/opt/x/guardian")
+
+
+def test_patch_rejects_compound_legacy_guardian_mount_mode():
+    source = """services:
+  mihomo-cliproxy:
+    image: x
+    volumes:
+      - /opt/x/guardian/bin/guardian:/guardian/bin/guardian:ro,z
+"""
+
+    with pytest.raises(ValueError, match="volume mode"):
+        patch_compose(source, "/opt/x/guardian")
+
+
 def test_patch_rejects_missing_target_service():
     with pytest.raises(ValueError, match="mihomo-cliproxy"):
         patch_compose("services:\n  other:\n    image: x\n", "/opt/x")

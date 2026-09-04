@@ -41,6 +41,16 @@ def test_update_script_only_terms_guardian_children():
     assert 'kill -TERM "$mihomo_pid"' not in script
 
 
+def test_update_script_uses_container_pid_namespace_for_process_control():
+    script = _script()
+
+    assert 'docker exec "$CONTAINER" ps -eo pid,ppid,comm,args' in script
+    assert "docker top" not in script
+    assert "launcher_pid" in script
+    assert "ancestor_distance" in script
+    assert "start-guardian\\.sh" in script
+
+
 def test_update_script_preserves_mihomo_pid_and_rolls_back_binary_on_failed_verification():
     script = _script()
 
@@ -55,6 +65,19 @@ def test_update_script_preserves_mihomo_pid_and_rolls_back_binary_on_failed_veri
     assert "docker compose down" not in script
 
 
+def test_update_script_rolls_back_on_post_replace_errors_and_checks_runtime():
+    script = _script()
+
+    assert "REPLACED=0" in script
+    assert "REPLACED=1" in script
+    assert "trap on_exit EXIT" in script
+    assert "update_rollback_failed" in script
+    assert 'flock -n 9' in script
+    assert "verify_mihomo_api" in script
+    assert "verify_proxy_listener" in script
+    assert '"$old_hash"' in script
+
+
 def test_update_preflight_is_read_only_with_a_directory_mount(tmp_path):
     guardian_root = tmp_path / "guardian"
     bin_dir = guardian_root / "bin"
@@ -65,6 +88,7 @@ def test_update_preflight_is_read_only_with_a_directory_mount(tmp_path):
     (guardian_root / "start-guardian.sh").write_text("#!/bin/sh\n", encoding="utf-8")
     (guardian_root / "start-guardian.sh").chmod(0o755)
     (guardian_root / "logs").mkdir()
+    (guardian_root / "run").mkdir()
     tmp_dir = tmp_path / "tmp"
     tmp_dir.mkdir()
 
@@ -114,10 +138,11 @@ if [ "$1" = inspect ]; then
     cat "$FAKE_INSPECT"
     exit 0
 fi
-if [ "$1" = top ]; then
+if [ "$1" = exec ] && [ "$3" = ps ]; then
     printf 'PID PPID COMMAND COMMAND\\n'
-    printf '101 1 mihomo /mihomo -d /config\\n'
-    printf '102 1 guardian /guardian/bin/guardian run --config /guardian/guardian.yaml\\n'
+    printf '8 1 mihomo /mihomo -d /config\\n'
+    printf '10 1 sh /bin/sh /guardian/start-guardian.sh\\n'
+    printf '9 10 guardian /guardian/bin/guardian run --config /guardian/guardian.yaml\\n'
     exit 0
 fi
 exit 1
@@ -148,7 +173,8 @@ exit 1
     docker_calls = docker_log.read_text(encoding="utf-8")
     assert "kill" not in docker_calls
     assert "run" not in docker_calls
-    assert "exec" not in docker_calls
+    assert "exec fixture ps" in docker_calls
+    assert "exec fixture kill" not in docker_calls
 
 
 def test_update_replaces_binary_and_keeps_mihomo_pid_with_fake_docker(tmp_path):
@@ -157,11 +183,16 @@ def test_update_replaces_binary_and_keeps_mihomo_pid_with_fake_docker(tmp_path):
     bin_dir.mkdir(parents=True)
     shutil.copy2("/bin/true", bin_dir / "guardian")
     config = guardian_root / "guardian.yaml"
-    config.write_text("decision:\n  mode: observe\n", encoding="utf-8")
+    config.write_text(
+        "mihomo:\n  api: http://127.0.0.1:9090\n  proxy: http://127.0.0.1:7890\n"
+        "decision:\n  mode: observe\n",
+        encoding="utf-8",
+    )
     (guardian_root / "controller_secret").write_text("redacted\n", encoding="utf-8")
     (guardian_root / "start-guardian.sh").write_text("#!/bin/sh\n", encoding="utf-8")
     (guardian_root / "start-guardian.sh").chmod(0o755)
     (guardian_root / "logs").mkdir()
+    (guardian_root / "run").mkdir()
     tmp_dir = tmp_path / "tmp"
     tmp_dir.mkdir()
     docker_log = tmp_path / "docker.log"
@@ -222,14 +253,32 @@ if [ "$1" = run ]; then
     cp "$FAKE_ARTIFACT_SOURCE" "$build_dir/guardian"
     exit 0
 fi
-if [ "$1" = top ]; then
+if [ "$1" = exec ] && [ "$3" = ps ]; then
     printf 'PID PPID COMMAND COMMAND\\n'
-    printf '101 1 mihomo /mihomo -d /config\\n'
+    printf '8 1 mihomo /mihomo -d /config\\n'
+    printf '10 1 sh /bin/sh /guardian/start-guardian.sh\\n'
     if grep -q '^after$' "$FAKE_DOCKER_STATE"; then
-        printf '103 1 guardian /guardian/bin/guardian run --config /guardian/guardian.yaml\\n'
+        printf '11 10 guardian /guardian/bin/guardian run --config /guardian/guardian.yaml\\n'
     else
-        printf '102 1 guardian /guardian/bin/guardian run --config /guardian/guardian.yaml\\n'
+        printf '9 10 guardian /guardian/bin/guardian run --config /guardian/guardian.yaml\\n'
     fi
+    exit 0
+fi
+if [ "$1" = exec ] && [ "$3" = /guardian/bin/guardian ]; then
+    exit 0
+fi
+if [ "$1" = exec ] && [ "$3" = sh ]; then
+    [ "$7" = 9 ]
+    printf 'after\n' > "$FAKE_DOCKER_STATE"
+    exit 0
+fi
+if [ "$1" = exec ] && [ "$3" = cat ] && [ "$4" = /proc/net/tcp ]; then
+    printf '  sl local_address rem_address   st\n'
+    printf '   0: 0100007F:1ED2 00000000:0000 0A\n'
+    exit 0
+fi
+if [ "$1" = exec ] && [ "$3" = cat ] && [ "$4" = /proc/net/tcp6 ]; then
+    printf '  sl local_address rem_address   st\n'
     exit 0
 fi
 if [ "$1" = exec ] && [ "$3" = cat ]; then
@@ -237,7 +286,7 @@ if [ "$1" = exec ] && [ "$3" = cat ]; then
     exit 0
 fi
 if [ "$1" = exec ] && [ "$3" = kill ]; then
-    [ "$5" = 102 ]
+    [ "$5" = 9 ]
     printf 'after\\n' > "$FAKE_DOCKER_STATE"
     exit 0
 fi
@@ -269,12 +318,12 @@ exit 1
     manifests = list((guardian_root / "backups").glob("update-*/manifest"))
     assert len(manifests) == 1
     manifest = manifests[0].read_text(encoding="utf-8")
-    assert "mihomo_pid=101" in manifest
+    assert "mihomo_pid=8" in manifest
     events = (guardian_root / "logs" / "guardian-update.jsonl").read_text(encoding="utf-8")
     for event in ("update_started", "binary_backed_up", "guardian_reloaded", "update_verified"):
         assert event in events
     docker_calls = docker_log.read_text(encoding="utf-8")
-    assert "exec fixture kill -TERM 102" in docker_calls
-    assert "kill -TERM 101" not in docker_calls
+    assert "exec fixture sh -c" in docker_calls
+    assert "kill -TERM 8" not in docker_calls
     assert "stop" not in docker_calls
     assert "restart" not in docker_calls

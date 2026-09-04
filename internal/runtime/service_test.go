@@ -425,6 +425,52 @@ func TestServiceUsesFastFailureRechecksAfterFirstFailure(t *testing.T) {
 	}
 }
 
+func TestServiceRoutePolicyRejectionOverridesVendorQuorum(t *testing.T) {
+	cfg := testServiceConfig()
+	cfg.Decision.CriticalQuorum = 1
+	cfg.Probes = append(cfg.Probes, config.ProbeSpec{
+		ID: "gemini", URL: "https://gemini.example/health", Critical: true, Enabled: true,
+	})
+	service := NewService(cfg, nil, mixedResultExternal{}, nil, nil)
+
+	summary := service.collectCriticalProbes(context.Background(), false)
+	if summary.Healthy {
+		t.Fatalf("route-policy rejection was hidden by quorum: %+v", summary)
+	}
+	if !summary.FailureEligible || !summary.RouteRejected {
+		t.Fatalf("route-policy rejection lost attribution: %+v", summary)
+	}
+}
+
+func TestServiceRestoresCurrentNodeWhenCandidateProbeIsCanceled(t *testing.T) {
+	api := &fakeAPI{
+		groups: map[string]mihomo.Proxy{
+			"BACKUP-USA": {Name: "BACKUP-USA", Now: "current", All: []string{"current", "candidate-a", "candidate-b"}},
+		},
+		providers: map[string]mihomo.Provider{
+			"backup-provider": {Name: "backup-provider", Proxies: []mihomo.Proxy{
+				{Name: "candidate-a", Alive: true, History: []mihomo.DelayHistory{{Delay: 100}}},
+				{Name: "candidate-b", Alive: true, History: []mihomo.DelayHistory{{Delay: 100}}},
+			}},
+		},
+	}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{Backup: "backup-provider"}
+	cancelled := make(chan struct{})
+	cancel := func() {}
+	ctx, cancelContext := context.WithCancel(context.Background())
+	cancel = cancelContext
+	service := NewService(cfg, api, cancelingExternal{cancelled: cancelled, cancel: cancel}, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil)
+
+	_, _, ok := service.findCompatibleProviderNode(ctx, "backup", cfg.Groups.Backup, api.groups[cfg.Groups.Backup], "current")
+	if ok {
+		t.Fatal("canceled candidate probe unexpectedly qualified a node")
+	}
+	if api.groups[cfg.Groups.Backup].Now != "current" {
+		t.Fatalf("current node was not restored after cancellation: %q", api.groups[cfg.Groups.Backup].Now)
+	}
+}
+
 func TestServiceMihomoNetworkHintInvalidatesHealthyProbeCache(t *testing.T) {
 	api := &fakeAPI{groups: map[string]mihomo.Proxy{
 		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
@@ -502,6 +548,30 @@ type countingResultExternal struct {
 	mu    sync.Mutex
 	count int
 	class probe.ResultClass
+}
+
+type mixedResultExternal struct{}
+
+func (mixedResultExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
+	if spec.ID == "gemini" {
+		return probe.Result{ProbeID: spec.ID, Class: probe.RoutePolicyError, Status: 400}
+	}
+	return probe.Result{ProbeID: spec.ID, Class: probe.ReachableHTTP, Status: 401}
+}
+
+type cancelingExternal struct {
+	cancelled chan struct{}
+	cancel    context.CancelFunc
+}
+
+func (f cancelingExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
+	select {
+	case <-f.cancelled:
+	default:
+		close(f.cancelled)
+		f.cancel()
+	}
+	return probe.Result{ProbeID: spec.ID, Class: probe.NetworkError}
 }
 
 func (f *countingResultExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {

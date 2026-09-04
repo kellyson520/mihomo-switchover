@@ -34,8 +34,8 @@ sudo ./scripts/install.sh
 需要只观察时执行 `sudo ./scripts/install.sh --observe`。
 
 安装器会在目标项目的 `guardian/backups/<UTC 时间>/` 保存 Compose、mihomo 配置、
-旧 systemd 切换器和清单。旧 `channel_switch.py` 不删除，但旧 systemd 服务会被停用，
-避免两个程序同时写 `CHANNEL`。
+guardian 二进制、launcher、controller secret、旧 systemd 切换器和清单。旧
+`channel_switch.py` 不删除，但旧 systemd 服务会被停用，避免两个程序同时写 `CHANNEL`。
 
 ## 重新注入与安全更新
 
@@ -69,6 +69,11 @@ guardian/quality 子进程，等待 launcher 拉起新版本；不会重建或�
 Mihomo 配置、provider、代理组、状态或质量 store。验证失败会自动原子恢复备份二进制，
 记录 `update_rolled_back`，仍不触碰 Mihomo。更新过程写入
 `guardian/logs/guardian-update.jsonl`，不写入 secret、API key、订阅 URL 或账号信息。
+
+更新前后会用容器内 ps 校验 guardian/quality 的父子关系，只向 guardian 子进程发 TERM；
+同时调用 guardian status 验证 Mihomo API，并检查 `/proc/net/tcp` 的代理监听。更新使用
+`guardian/run/guardian-update.lock` 防止并发替换；如果出现 `update_rollback_failed`，
+立即停止继续操作并人工核对备份 hash。
 
 ## 运行目录与配置
 
@@ -152,7 +157,17 @@ docker exec mihomo-cliproxy /guardian/bin/guardian quality baseline-reset \
 sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
 ```
 
-回滚前检查最新备份清单，恢复 Compose、mihomo 配置和旧 systemd 服务；guardian 的
+自动失败回滚会固定使用本次安装创建的备份目录；人工回滚建议先从
+`/opt/mihomo-cliproxy/guardian/backups/` 选择并显式指定目录：
+
+```sh
+sudo ./scripts/rollback.sh \
+  --guardian-root /opt/mihomo-cliproxy/guardian \
+  --backup-dir /opt/mihomo-cliproxy/guardian/backups/UTC-TIMESTAMP-PID
+```
+
+脚本会先严格校验 manifest 和所有备份文件，再分阶段原子恢复；中途校验、文件或
+Compose 失败会尝试恢复回滚前的 host 文件。回滚恢复 Compose、mihomo 配置和旧 systemd 服务；guardian 的
 状态、质量 reports/baselines/scan progress、日志和备份目录保留，不删除节点或审计数据。
 
 ## 本地验证

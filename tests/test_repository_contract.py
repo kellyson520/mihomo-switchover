@@ -118,6 +118,10 @@ def test_update_flow_documents_migration_and_guardian_only_daily_updates():
         "guardian/quality",
         "维护窗口",
         "日常更新",
+        "update_rollback_failed",
+        "guardian-update.lock",
+        "代理监听",
+        "容器内 ps",
     )
     for document in documents:
         for marker in required:

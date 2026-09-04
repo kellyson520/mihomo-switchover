@@ -78,6 +78,13 @@ provider、代理组、状态或质量 store。验证失败只恢复旧二进制
 API key、订阅 URL 或账号信息。普通日常更新不需要维护窗口；若仍看到
 `migration_required=1`，停止并安排一次迁移，不能绕过门禁。
 
+更新器用容器内 ps 校验 guardian/quality 的 launcher 父子关系，不能把 `docker top` 的
+宿主 PID 交给 `docker exec`；只允许向匹配的 guardian 子进程发 TERM。它还用只读 guardian
+status 验证 Mihomo API，并检查 `/proc/net/tcp` 的代理监听。更新锁为
+`guardian/run/guardian-update.lock`；出现 `update_rollback_failed` 时停止自动操作，人工
+校验旧 hash 和备份，不得用重启 Mihomo 掩盖问题。Compose 长语法和复合 volume mode 会被
+明确拒绝，避免重复或错误挂载。
+
 ## 配置修改办法
 
 生产只改一个文件：
@@ -271,8 +278,10 @@ docker exec mihomo-cliproxy /guardian/bin/guardian auto \
 ```
 
 不要在 `observe` 验收前启用自动切换。安装器会备份 Compose、mihomo 配置、旧切换器、
-状态、guardian 配置、质量 store（reports、baselines、scan progress、audit）和
-`quality.jsonl`；预检失败时不得继续写入。
+launcher、controller secret、guardian 二进制、状态、guardian 配置、质量 store
+（reports、baselines、scan progress、audit）和 `quality.jsonl`；预检失败时不得继续写入。
+任一写入后的异常都会由退出钩子尝试完整恢复，回滚失败时必须人工接管，不能重启 Mihomo
+盲目补救。
 
 ## 验收清单
 
@@ -322,6 +331,10 @@ sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
 
 此回滚会重建 Compose 服务，可能短暂重启 mihomo，必须确认维护窗口；它是受控回滚路径，
 不能用 `docker compose down` 替代。回滚后再次执行只读状态和完整验收。
+安装器失败时会固定回滚本次 `backup_dir`；人工回滚先选完整备份并显式使用
+`--backup-dir /opt/mihomo-cliproxy/guardian/backups/UTC-TIMESTAMP-PID`，不要让脚本猜测。
+回滚先严格校验 manifest、presence 标记、固定目标路径和二进制 hash，再分阶段恢复文件；
+中途失败会尝试恢复回滚前文件，若恢复失败必须人工接管。
 回滚会先把当前质量 store 和质量日志保存到 `backups/rollback-preserved-*`，然后恢复
 部署文件；不会删除或覆盖当前质量历史，便于排查回滚前后的分数变化。
 

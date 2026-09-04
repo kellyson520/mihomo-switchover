@@ -3,8 +3,11 @@ package mihomo
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -152,3 +155,40 @@ func TestClientTriggersProviderHealthCheck(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestClientRejectsAPIResponseBodyReadFailure(t *testing.T) {
+	client := &Client{
+		base:   mustURL(t, "http://127.0.0.1:9090"),
+		secret: "secret",
+		http: &http.Client{Transport: clientRoundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: failingAPIResponseBody{}}, nil
+		})},
+	}
+
+	if err := client.Heartbeat(context.Background()); err == nil {
+		t.Fatal("truncated API response was accepted as a healthy heartbeat")
+	}
+}
+
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parsed
+}
+
+type clientRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f clientRoundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type failingAPIResponseBody struct{}
+
+func (failingAPIResponseBody) Read([]byte) (int, error) {
+	return 0, errors.New("response body read failed")
+}
+
+func (failingAPIResponseBody) Close() error { return io.EOF }
