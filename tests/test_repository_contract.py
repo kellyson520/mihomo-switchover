@@ -100,3 +100,25 @@ def test_quality_cli_and_status_are_documented_without_secret_output():
     for marker in ("quality status", "baseline-reset", "minimum_coverage_percent", "quality.jsonl"):
         assert marker in skill, marker
     assert "quality" in readme
+
+
+def test_update_flow_documents_migration_and_guardian_only_daily_updates():
+    documents = (
+        _read("README.md"),
+        _read("docs/configuration.md"),
+        _read("skills/mihomo-guardian-production/SKILL.md"),
+    )
+    required = (
+        "update-guardian.sh",
+        "--preflight",
+        "--migrate-bin-mount",
+        "migration_required=1",
+        "/guardian/bin:/guardian/bin",
+        "原子",
+        "guardian/quality",
+        "维护窗口",
+        "日常更新",
+    )
+    for document in documents:
+        for marker in required:
+            assert marker in document, marker

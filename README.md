@@ -10,8 +10,8 @@ mihomo 容器内，guardian 不读取或修改账号、额度、登录态或业�
   mihomo 发信号。只有 Docker 正常停止容器时，启动器才同时清理两个子进程。
 - 控制 API 只用于容器内回环直连；所有 OpenAI、Gemini、Anthropic、OpenRouter、
   DeepSeek 和纯净度探测都强制经自动发现的容器内回环代理端口。
-- 不使用 API Key；厂商入口收到 `200–499` 都代表入口可达，`5xx`、DNS、TCP、TLS
-  和超时才算本次探测失败。
+- 不使用 API Key；厂商入口收到 `200–499` 通常代表入口可达，但命中显式配置的地区/线路
+  政策拒绝响应体时会标记为不可用，`5xx`、DNS、TCP、TLS 和超时仍分别记录。
 - 纯净度/IP/ASN 只产生告警和评分，默认不能触发自动切换。
 - 配置、节点锁定、状态、日志和备份全部在宿主机挂载区，重建容器不会丢失。
 
@@ -36,6 +36,39 @@ sudo ./scripts/install.sh
 安装器会在目标项目的 `guardian/backups/<UTC 时间>/` 保存 Compose、mihomo 配置、
 旧 systemd 切换器和清单。旧 `channel_switch.py` 不删除，但旧 systemd 服务会被停用，
 避免两个程序同时写 `CHANNEL`。
+
+## 重新注入与安全更新
+
+旧版本可能把 guardian 二进制作为单文件挂载；这会固定旧 inode，宿主机替换文件不会让
+运行中的容器看到新版本。先只读确认：
+
+```sh
+sudo ./scripts/install.sh --preflight
+sudo ./scripts/update-guardian.sh --preflight
+```
+
+如果输出 `migration_required=1`，必须在维护窗口执行一次：
+
+```sh
+sudo ./scripts/install.sh --migrate-bin-mount --observe
+```
+
+这次迁移把挂载改为 `/opt/mihomo-cliproxy/guardian/bin:/guardian/bin:ro`，可能重建
+Compose 服务并短暂影响 Mihomo；迁移前安装器会备份并校验，迁移失败会走回滚。观察确认
+Mihomo、代理端口和 guardian 正常后，再按既定命令切回 `auto`。
+
+迁移完成后，日常更新只使用：
+
+```sh
+sudo ./scripts/update-guardian.sh --preflight
+sudo ./scripts/update-guardian.sh --observe
+```
+
+更新器在持久化挂载目录内完成新 ELF/hash 校验、旧文件备份和原子 rename，只 TERM
+guardian/quality 子进程，等待 launcher 拉起新版本；不会重建或重启 Mihomo，不修改
+Mihomo 配置、provider、代理组、状态或质量 store。验证失败会自动原子恢复备份二进制，
+记录 `update_rolled_back`，仍不触碰 Mihomo。更新过程写入
+`guardian/logs/guardian-update.jsonl`，不写入 secret、API key、订阅 URL 或账号信息。
 
 ## 运行目录与配置
 
@@ -67,6 +100,12 @@ sudo ./scripts/install.sh
 新样本，缓存期间不会重复访问厂商，也不会重复累计同一个失败。修改
 `decision.probe_interval` 可热重载调整正常频率，修改 `decision.failure_recheck_interval`
 可调整故障确认周期；日志提示本身永远不会直接切换渠道。
+
+Gemini 的 `400 User location is not supported` 不是普通认证失败。为避免把它算作“入口可达”，
+探测配置可为 Gemini 增加 `reject_body_patterns`。命中后 guardian 会在同一 provider 的
+其他 `alive + history` 节点中逐个复核，并要求所有启用的 `critical` 厂商探测通过；找到同时
+满足 OpenAI 与 Gemini 的节点后才固定它。候选检查只写 provider 组，不直接改总选择器；没有
+合格候选时恢复原节点并保持 fail-closed。
 
 ## 运维命令
 

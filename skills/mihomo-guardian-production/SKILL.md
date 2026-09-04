@@ -43,6 +43,41 @@ sudo ./scripts/install.sh --preflight
 loopback 代理端口、`CHANNEL/MAIN/BACKUP` 组和 provider 映射均唯一。发现不唯一时停止，
 使用 `--container` 或 `--compose` 明确指定；不要猜端口、IP、组名或挂载路径。
 
+## 重新注入与更新门禁
+
+先区分“一次性挂载迁移”和“日常二进制更新”，不要把普通更新走成容器重建：
+
+```sh
+sudo ./scripts/install.sh --preflight
+sudo ./scripts/update-guardian.sh --preflight
+```
+
+若任一预检报告 `migration_required=1`，当前仍是旧的单文件 guardian 挂载。必须先确认
+维护窗口，再显式执行：
+
+```sh
+sudo ./scripts/install.sh --migrate-bin-mount --observe
+```
+
+这次迁移将 `/guardian/bin/guardian` 改为持久化目录挂载
+`/opt/mihomo-cliproxy/guardian/bin:/guardian/bin:ro`，可能重建 Compose 服务并短暂影响
+Mihomo；安装器会先备份、验证 Compose 和 mihomo 配置，失败时使用备份回滚。观察模式验收
+Mihomo PID、代理端口、guardian 进程、OpenAI/Gemini 探测和日志后，才恢复 `auto`。
+
+目录挂载完成后，日常更新只能使用：
+
+```sh
+sudo ./scripts/update-guardian.sh --preflight
+sudo ./scripts/update-guardian.sh --observe
+```
+
+更新器验证新 ELF/hash，在宿主持久化目录内备份并原子 rename，只 TERM guardian/quality
+子进程并等待 launcher 拉起新版本；不会重建、停止或重启 Mihomo，也不修改 Mihomo 配置、
+provider、代理组、状态或质量 store。验证失败只恢复旧二进制并记录
+`update_rolled_back`。更新日志为 `guardian/logs/guardian-update.jsonl`，不得包含 secret、
+API key、订阅 URL 或账号信息。普通日常更新不需要维护窗口；若仍看到
+`migration_required=1`，停止并安排一次迁移，不能绕过门禁。
+
 ## 配置修改办法
 
 生产只改一个文件：
@@ -92,6 +127,26 @@ provider 的原生 `/healthcheck`，按独立的 `recovery_healthcheck_interval`
 选择 `CHANNEL`，不会让备用流量短暂经过主渠道。请求失败继续 fail-closed。日志会出现
 `provider_healthcheck_requested` 或 `provider_healthcheck_failed`。修改后按上面的
 `reload` 流程校验，先在 `observe` 模式观察日志。
+
+### Gemini 地区锁定与双厂商候选
+
+Gemini 返回 `400 User location is not supported` 时，不能按普通 400/403 入口响应处理。
+在对应探测下增加显式拒绝模式，例如：
+
+```yaml
+- id: gemini
+  url: https://generativelanguage.googleapis.com/v1beta/models
+  critical: true
+  reject_body_patterns:
+    - '(?i)user\s+location.{0,120}(not\s+supported|unsupported|not\s+available|unavailable)'
+    - '(?i)service.{0,120}(not\s+available|unavailable).{0,120}(country|region)'
+```
+
+命中后记录 `route_policy_error`，guardian 仅从同一 provider 的 `alive + history` 节点中
+逐个复核，并要求所有启用的 `critical` 探测通过。配置了 OpenAI 和 Gemini 为 critical 时，
+候选必须同时通过两者才会被固定；成功后只写对应 provider 组，不直接改 `CHANNEL`。候选
+全部失败时恢复原节点并保持现有 fail-closed 决策。响应体不写入日志，模式错误会在热重载
+时拒绝并继续使用上一份有效配置。
 
 ### Quality 目标配置
 
@@ -208,7 +263,7 @@ sudo ./scripts/install.sh --observe
 ```
 
 确认 `mihomo` 和 `guardian` 都在运行、代理端口可用、OpenAI/Gemini 返回可接受的
-`200–499`（401/403 代表入口可达，不代表账号认证成功），并检查日志后，才允许：
+`200–499`（未命中拒绝模式时，401/403 代表入口可达，不代表账号认证成功），并检查日志后，才允许：
 
 ```sh
 docker exec mihomo-cliproxy /guardian/bin/guardian auto \
@@ -274,7 +329,7 @@ sudo ./scripts/rollback.sh --guardian-root /opt/mihomo-cliproxy/guardian
 
 - 把宿主发布的 `7891` 当成容器内代理：使用发现结果，容器内通常是
   `127.0.0.1:<mixed/http/socks port>`。
-- 把 401/403 当成线路失败：默认 `200–499` 都是入口可达。
+- 把未命中拒绝模式的 401/403 当成线路失败：默认 `200–499` 都是入口可达。
 - provider 没有历史仍强行选节点：保持 fail-closed，等待 mihomo provider 健康数据。
 - 直接切换到延迟最低节点：优先持久化锁定的健康节点，避免出口频繁变化。
 - 修改 `mihomo.api`/组/provider 后只执行 reload：这些字段需要 guardian 重启或重新走

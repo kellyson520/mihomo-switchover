@@ -148,6 +148,43 @@ reload:
 会替换内存配置；错误文件继续使用上一份有效配置，并写入
 `config_reload_failed`。有效热重载写入 `config_reloaded`。
 
+## 二进制重新注入与更新流程
+
+行为配置热重载和 guardian 二进制更新是两条独立路径；更新二进制不会改写
+`guardian.yaml`。旧注入若把单文件挂载到 `/guardian/bin/guardian`，宿主机替换文件不会
+更新运行中的容器。先执行两个只读预检：
+
+```sh
+sudo ./scripts/install.sh --preflight
+sudo ./scripts/update-guardian.sh --preflight
+```
+
+预检输出 `migration_required=1` 时，只能在明确维护窗口执行一次迁移：
+
+```sh
+sudo ./scripts/install.sh --migrate-bin-mount --observe
+```
+
+安装器先备份 Compose、mihomo 配置、guardian 状态和质量数据，再把二进制改成持久化目录
+挂载 `/opt/mihomo-cliproxy/guardian/bin:/guardian/bin:ro`。这一步可能触发 Compose 服务
+重建，可能短暂重启 Mihomo，因此必须先安排维护窗口并在 `observe` 下验收。预检、Compose
+校验或运行时验收失败时停止继续操作，使用既有备份回滚。
+
+迁移成功后，日常重新注入只执行：
+
+```sh
+sudo ./scripts/update-guardian.sh --preflight
+sudo ./scripts/update-guardian.sh --observe
+```
+
+更新器在同一持久化目录内验证 Linux amd64 ELF 和 SHA-256，备份旧二进制后使用原子
+rename；随后只 TERM guardian/quality 子进程，由 launcher 拉起新 guardian。它会保存并
+复核 Mihomo PID、容器 ID 和代理进程；失败时只恢复二进制并再次刷新 guardian，记录
+`update_rolled_back`，不会修改 Mihomo 配置、provider、代理组、质量 store，也不会做容器
+级别重启。更新日志位于 `guardian/logs/guardian-update.jsonl`，不包含 secret、API key、
+订阅 URL 或账号信息。普通日常更新不需要维护窗口，但当前输出仍为 `migration_required=1`
+时不得绕过迁移门禁。
+
 ## 字段说明
 
 ### `mihomo`
@@ -301,18 +338,28 @@ guardian 会立即打破当前公网探测缓存；日志本身不直接触发�
 ### `probes`
 
 每个探测包含 `id`、`url`、`critical`，可选 `enabled`、`method`、`timeout`、
-`delay_timeout`、`expected_min` 和 `expected_max`。默认方法为 `GET`，默认超时为
-`5s`，默认可接受状态范围为 `200–499`。
+`delay_timeout`、`expected_min`、`expected_max` 和 `reject_body_patterns`。默认方法为
+`GET`，默认超时为 `5s`，默认可接受状态范围为 `200–499`。
 
 探测分类规则是：
 
 - `200–499`（包括常见的 `401`、`403`、`429`）表示厂商入口可达，不要求 API key；
+- 如果响应体匹配该探测的 `reject_body_patterns`，则分类为 `route_policy_error`，覆盖上面的
+  通用可达结论；适合 Gemini 的 `User location is not supported` 等出口地区拒绝；
 - `5xx` 表示上游服务错误，本次失败；
 - DNS、TCP、TLS、代理连接和超时错误表示本次失败；
 - 其他不在期望范围内的状态记录为 `unexpected_http`。
 
-因此，401/403 不能单独证明账号可用，也不能单独证明线路失效；它们只证明厂商入口
-通过当前代理可达。调整 `expected_min/max` 前必须确认不会把认证错误误判成线路故障。
+因此，未命中拒绝模式的 401/403 不能单独证明账号可用，也不能单独证明线路失效；它们只
+证明厂商入口通过当前代理可达。命中地区拒绝模式则表示当前出口不能满足该厂商，guardian
+会触发候选节点复核。调整 `expected_min/max` 前必须确认不会把认证错误误判成线路故障。
+
+`reject_body_patterns` 是 RE2 正则数组，由配置文件显式提供；响应体只在内存中读取并限制
+大小，不写入日志。配置合法但命中时，guardian 不会把原始响应体记录到日志，只记录
+`route_policy_error` 分类和候选复核结果。候选复核只考虑 provider 返回的 `alive: true` 且
+有 `history` 的节点，按 provider/group 原有顺序尝试，所有启用的 `critical` 探测必须通过，
+所以配置了 OpenAI 与 Gemini 两个关键探测时，固定节点一定要同时满足两者。候选都不合格时
+恢复原节点，不因一次地区响应把整个 mihomo 或总选择器停掉。
 
 推荐至少保留 OpenAI 和 Gemini 两个 `critical: true` 探测；可按实际号池增加
 Anthropic、OpenRouter、DeepSeek，但不要把单一厂商当成唯一切换依据。
