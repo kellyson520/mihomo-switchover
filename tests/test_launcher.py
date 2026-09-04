@@ -86,3 +86,30 @@ def test_install_does_not_swallow_rollback_failure_or_write_repo_temp_files():
     assert all("|| true" not in line for line in rollback_calls)
     assert ".guardian.inspect.json" not in script
     assert ".guardian.discovery.json" not in script
+
+
+def test_install_gates_legacy_single_file_mount_migration():
+    script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    assert "MIGRATE_BIN_MOUNT=0" in script
+    assert "--migrate-bin-mount" in script
+    assert "GUARDIAN_BIN_MOUNT_MODE" in script
+    assert "GUARDIAN_BIN_SOURCE" in script
+    assert "migration_required=1" in script
+    assert "legacy-file" in script
+    assert "maintenance window" in script
+
+
+def test_install_detects_directory_and_legacy_guardian_destinations():
+    script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    assert "/guardian/bin/guardian" in script
+    assert "/guardian/bin" in script
+    assert "Mounts" in script
+    assert "Mode" in script
+
+
+def test_install_has_no_container_wide_stop_or_restart_commands():
+    script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    assert "docker stop" not in script
+    assert "docker restart" not in script
+    assert "docker kill" not in script
+    assert "docker compose down" not in script

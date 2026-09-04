@@ -11,15 +11,17 @@ CONTAINER=${MIHOMO_CONTAINER:-mihomo-cliproxy}
 COMPOSE_PATH=${MIHOMO_COMPOSE:-}
 PRELIGHT=0
 OBSERVE=0
+MIGRATE_BIN_MOUNT=0
 
 usage() {
-    echo "usage: $0 [--preflight] [--observe] [--compose PATH] [--container NAME]" >&2
+    echo "usage: $0 [--preflight] [--observe] [--migrate-bin-mount] [--compose PATH] [--container NAME]" >&2
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --preflight) PRELIGHT=1; shift ;;
         --observe) OBSERVE=1; shift ;;
+        --migrate-bin-mount) MIGRATE_BIN_MOUNT=1; shift ;;
         --compose) [ "$#" -ge 2 ] || { usage; exit 2; }; COMPOSE_PATH=$2; shift 2 ;;
         --container) [ "$#" -ge 2 ] || { usage; exit 2; }; CONTAINER=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
@@ -81,6 +83,51 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 docker inspect "$CONTAINER" >"$INSPECT_FILE"
+
+GUARDIAN_BIN_MOUNT_INFO=$(python3 - "$INSPECT_FILE" "$GUARDIAN_ROOT" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+inspect_path = Path(sys.argv[1])
+guardian_root = Path(sys.argv[2]).resolve()
+data = json.loads(inspect_path.read_text(encoding="utf-8"))
+if len(data) != 1:
+    raise SystemExit("container inspection did not identify exactly one container")
+
+mounts = data[0].get("Mounts", [])
+legacy = [mount for mount in mounts if mount.get("Destination") == "/guardian/bin/guardian"]
+directory = [mount for mount in mounts if mount.get("Destination") == "/guardian/bin"]
+if len(legacy) > 1 or len(directory) > 1 or (legacy and directory):
+    raise SystemExit("guardian binary mounts are missing, duplicated, or ambiguous")
+
+if legacy:
+    mount = legacy[0]
+    expected = guardian_root / "bin" / "guardian"
+    mode = "legacy-file"
+elif directory:
+    mount = directory[0]
+    expected = guardian_root / "bin"
+    mode = "directory"
+else:
+    print("missing")
+    print("")
+    raise SystemExit(0)
+
+source = Path(mount.get("Source", ""))
+if not source.is_absolute() or source != expected:
+    raise SystemExit(f"guardian mount source does not match {expected}")
+if mount.get("Mode") != "ro" or mount.get("RW") is not False:
+    raise SystemExit("guardian binary mount must be read-only")
+if source.exists() and source.resolve() != source:
+    raise SystemExit("guardian binary mount source is symlinked")
+print(mode)
+print(source)
+PY
+)
+GUARDIAN_BIN_MOUNT_MODE=$(printf '%s\n' "$GUARDIAN_BIN_MOUNT_INFO" | sed -n '1p')
+GUARDIAN_BIN_SOURCE=$(printf '%s\n' "$GUARDIAN_BIN_MOUNT_INFO" | sed -n '2p')
 
 CONFIG_PATH=$(python3 - "$INSPECT_FILE" <<'PY'
 import json
@@ -216,6 +263,17 @@ echo "discovered api=$DISCOVERED_API"
 echo "discovered proxy=$DISCOVERED_PROXY"
 echo "discovered groups channel=$DISCOVERED_CHANNEL main=$DISCOVERED_MAIN backup=$DISCOVERED_BACKUP"
 echo "discovered providers main=${DISCOVERED_MAIN_PROVIDER:-unknown} backup=${DISCOVERED_BACKUP_PROVIDER:-unknown}"
+echo "guardian_bin_mount=$GUARDIAN_BIN_MOUNT_MODE source=${GUARDIAN_BIN_SOURCE:-unknown}"
+
+if [ "$GUARDIAN_BIN_MOUNT_MODE" = "legacy-file" ]; then
+    echo "migration_required=1"
+    if [ "$PRELIGHT" -eq 0 ] && [ "$MIGRATE_BIN_MOUNT" -ne 1 ]; then
+        echo "legacy guardian binary mount detected; use --migrate-bin-mount during a maintenance window" >&2
+        exit 1
+    fi
+else
+    echo "migration_required=0"
+fi
 
 PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_PROVIDERS_DIR" "$DISCOVERED_BACKUP_PROVIDER" <<'PY'
 import sys
