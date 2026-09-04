@@ -112,7 +112,7 @@ def _replace_scalar_property(lines: list[str], key: str, replacement: str) -> li
 def _ensure_mounts(lines: list[str], root: Path) -> list[str]:
     mounts = [
         ("/guardian/start-guardian.sh", root / "start-guardian.sh", "ro"),
-        ("/guardian/bin/guardian", root / "bin" / "guardian", "ro"),
+        ("/guardian/bin", root / "bin", "ro"),
         ("/guardian/guardian.yaml", root / "guardian.yaml", "ro"),
         ("/guardian/data", root / "data", "rw"),
         ("/guardian/logs", root / "logs", "rw"),
@@ -134,6 +134,25 @@ def _ensure_mounts(lines: list[str], root: Path) -> list[str]:
     while end < len(lines) and (_indent(lines[end]) > 4 or not lines[end].strip()):
         end += 1
     existing = lines[volume_index + 1 : end]
+
+    directory_indexes = [
+        index for index, line in enumerate(existing) if _volume_target(line) == "/guardian/bin"
+    ]
+    if len(directory_indexes) > 1:
+        raise ValueError("guardian/bin mount is duplicated")
+    if directory_indexes:
+        source, mode = _volume_source_and_mode(existing[directory_indexes[0]])
+        if source != str(root / "bin"):
+            raise ValueError("guardian/bin mount source conflicts with guardian root")
+        if mode != "ro":
+            raise ValueError("guardian/bin mount must be read-only")
+
+    # A legacy single-file bind mount pins the old inode inside the container.
+    # Remove it while normalizing the service to the directory mount so a later
+    # atomic host rename becomes visible without rebuilding the image.
+    existing = [
+        line for line in existing if _volume_target(line) != "/guardian/bin/guardian"
+    ]
     for target, source, mode in mounts:
         canonical = f"      - {source}:{target}:{mode}\n"
         found = None
@@ -187,6 +206,19 @@ def _volume_target(line: str) -> str | None:
     return parts[-2] if len(parts) >= 3 and parts[-1] in {"ro", "rw", "z", "Z"} else parts[-1]
 
 
+def _volume_source_and_mode(line: str) -> tuple[str, str | None]:
+    """Return the source and mode for a short-form Compose volume line."""
+
+    stripped = line.strip()
+    value = stripped[1:].strip().strip('"\'')
+    parts = value.split(":")
+    if len(parts) < 2:
+        return "", None
+    if len(parts) >= 3 and parts[-1] in {"ro", "rw", "z", "Z"}:
+        return ":".join(parts[:-2]), parts[-1]
+    return ":".join(parts[:-1]), None
+
+
 def _indent(line: str) -> int:
     return len(line) - len(line.lstrip(" ")) if line.strip() else 99
 
@@ -196,7 +228,7 @@ def _validate_result(text: str) -> None:
         'entrypoint: ["/bin/sh", "/guardian/start-guardian.sh"]',
         "command: []",
         "/guardian/start-guardian.sh",
-        "/guardian/bin/guardian",
+        "/guardian/bin:ro",
         "/guardian/guardian.yaml",
         "/guardian/data",
         "/guardian/logs",
