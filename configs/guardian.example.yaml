@@ -60,6 +60,10 @@ decision:
   interval: 15s
   # 主循环保持较快；公网厂商探测至少每 5 分钟刷新一次。
   probe_interval: 5m
+  # 仅在最近一次关键探测失败后启用；用于两分钟内的有界复核。
+  failure_recheck_interval: 30s
+  # 备用运行期间主 provider 原生健康检查的最短间隔。
+  recovery_healthcheck_interval: 2m
   failures_before_switch: 3
   recoveries_before_switch: 2
   min_hold: 120s

@@ -108,6 +108,37 @@ func TestLoadAppliesConservativeDefaults(t *testing.T) {
 	if cfg.Decision.MinHold != 120*time.Second {
 		t.Fatalf("min hold=%s", cfg.Decision.MinHold)
 	}
+	if cfg.Decision.FailureRecheckInterval != 30*time.Second {
+		t.Fatalf("failure recheck interval=%s, want 30s", cfg.Decision.FailureRecheckInterval)
+	}
+	if cfg.Decision.RecoveryHealthcheckInterval != 2*time.Minute {
+		t.Fatalf("recovery healthcheck interval=%s, want 2m", cfg.Decision.RecoveryHealthcheckInterval)
+	}
+}
+
+func TestLoadParsesAdaptiveDecisionIntervals(t *testing.T) {
+	data := []byte(strings.Replace(string(validMinimalConfig(t)),
+		"  failures_before_switch: 3\n",
+		"  failures_before_switch: 3\n  failure_recheck_interval: 30s\n  recovery_healthcheck_interval: 2m\n", 1))
+	cfg, err := LoadBytes(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Decision.FailureRecheckInterval != 30*time.Second || cfg.Decision.RecoveryHealthcheckInterval != 2*time.Minute {
+		t.Fatalf("adaptive intervals=%s/%s", cfg.Decision.FailureRecheckInterval, cfg.Decision.RecoveryHealthcheckInterval)
+	}
+}
+
+func TestLoadRejectsInvalidAdaptiveDecisionIntervals(t *testing.T) {
+	for _, field := range []string{"failure_recheck_interval", "recovery_healthcheck_interval"} {
+		data := []byte(strings.Replace(string(validMinimalConfig(t)),
+			"  failures_before_switch: 3\n",
+			"  failures_before_switch: 3\n  "+field+": not-a-duration\n", 1))
+		_, err := LoadBytes(data)
+		if err == nil || !strings.Contains(err.Error(), "decision."+field) {
+			t.Fatalf("field=%s error=%v, want field name", field, err)
+		}
+	}
 }
 
 func TestLoadDefaultsPublicProbeIntervalToFiveMinutes(t *testing.T) {

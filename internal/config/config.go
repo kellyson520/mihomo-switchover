@@ -45,15 +45,17 @@ type ProvidersConfig struct {
 }
 
 type DecisionConfig struct {
-	Mode                   string        `yaml:"mode"`
-	Interval               time.Duration `yaml:"-"`
-	ProbeInterval          time.Duration `yaml:"-"`
-	FailuresBeforeSwitch   int           `yaml:"failures_before_switch"`
-	RecoveriesBeforeSwitch int           `yaml:"recoveries_before_switch"`
-	MinHold                time.Duration `yaml:"-"`
-	LinkLossGrace          time.Duration `yaml:"-"`
-	StartupAPITimeout      time.Duration `yaml:"-"`
-	CriticalQuorum         int           `yaml:"critical_quorum"`
+	Mode                        string        `yaml:"mode"`
+	Interval                    time.Duration `yaml:"-"`
+	ProbeInterval               time.Duration `yaml:"-"`
+	FailureRecheckInterval      time.Duration `yaml:"-"`
+	RecoveryHealthcheckInterval time.Duration `yaml:"-"`
+	FailuresBeforeSwitch        int           `yaml:"failures_before_switch"`
+	RecoveriesBeforeSwitch      int           `yaml:"recoveries_before_switch"`
+	MinHold                     time.Duration `yaml:"-"`
+	LinkLossGrace               time.Duration `yaml:"-"`
+	StartupAPITimeout           time.Duration `yaml:"-"`
+	CriticalQuorum              int           `yaml:"critical_quorum"`
 }
 
 type ProbeSpec struct {
@@ -154,15 +156,17 @@ type rawConfig struct {
 }
 
 type rawDecision struct {
-	Mode                   string `yaml:"mode"`
-	Interval               string `yaml:"interval"`
-	ProbeInterval          string `yaml:"probe_interval"`
-	FailuresBeforeSwitch   int    `yaml:"failures_before_switch"`
-	RecoveriesBeforeSwitch int    `yaml:"recoveries_before_switch"`
-	MinHold                string `yaml:"min_hold"`
-	LinkLossGrace          string `yaml:"link_loss_grace"`
-	StartupAPITimeout      string `yaml:"startup_api_timeout"`
-	CriticalQuorum         int    `yaml:"critical_quorum"`
+	Mode                        string `yaml:"mode"`
+	Interval                    string `yaml:"interval"`
+	ProbeInterval               string `yaml:"probe_interval"`
+	FailureRecheckInterval      string `yaml:"failure_recheck_interval"`
+	RecoveryHealthcheckInterval string `yaml:"recovery_healthcheck_interval"`
+	FailuresBeforeSwitch        int    `yaml:"failures_before_switch"`
+	RecoveriesBeforeSwitch      int    `yaml:"recoveries_before_switch"`
+	MinHold                     string `yaml:"min_hold"`
+	LinkLossGrace               string `yaml:"link_loss_grace"`
+	StartupAPITimeout           string `yaml:"startup_api_timeout"`
+	CriticalQuorum              int    `yaml:"critical_quorum"`
 }
 
 type rawProbe struct {
@@ -281,6 +285,14 @@ func normalize(raw rawConfig) (Config, error) {
 	cfg.Decision.ProbeInterval, err = durationOrDefault(raw.Decision.ProbeInterval, 5*time.Minute)
 	if err != nil {
 		return Config{}, fieldError("decision.probe_interval", err)
+	}
+	cfg.Decision.FailureRecheckInterval, err = durationOrDefault(raw.Decision.FailureRecheckInterval, 30*time.Second)
+	if err != nil {
+		return Config{}, fieldError("decision.failure_recheck_interval", err)
+	}
+	cfg.Decision.RecoveryHealthcheckInterval, err = durationOrDefault(raw.Decision.RecoveryHealthcheckInterval, 2*time.Minute)
+	if err != nil {
+		return Config{}, fieldError("decision.recovery_healthcheck_interval", err)
 	}
 	cfg.Decision.MinHold, err = durationOrDefault(raw.Decision.MinHold, 120*time.Second)
 	if err != nil {
