@@ -141,6 +141,25 @@ func TestLoadRejectsInvalidAdaptiveDecisionIntervals(t *testing.T) {
 	}
 }
 
+func TestLoadParsesAndValidatesProbeBodyRejectionPatterns(t *testing.T) {
+	data := strings.Replace(string(validMinimalConfig(t)),
+		"    critical: true\n  - id: gemini",
+		"    critical: true\n  - id: gemini\n    reject_body_patterns:\n      - '(?i)user\\s+location.*not\\s+supported'",
+		1)
+	cfg, err := LoadBytes([]byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Probes) != 2 || len(cfg.Probes[1].RejectBodyPatterns) != 1 {
+		t.Fatalf("probe rejection patterns=%+v", cfg.Probes)
+	}
+
+	invalid := strings.Replace(data, "(?i)user\\s+location.*not\\s+supported", "[", 1)
+	if _, err := LoadBytes([]byte(invalid)); err == nil || !strings.Contains(err.Error(), "reject_body_patterns") {
+		t.Fatalf("invalid body rejection pattern error=%v", err)
+	}
+}
+
 func TestLoadDefaultsPublicProbeIntervalToFiveMinutes(t *testing.T) {
 	data := []byte(strings.Replace(string(validMinimalConfig(t)), "  interval: 15s\n", "", 1))
 	cfg, err := LoadBytes(data)

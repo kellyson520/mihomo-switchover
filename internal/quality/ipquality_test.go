@@ -166,6 +166,24 @@ func TestCollectorDoesNotCountVendorWhenResponseBodyReadFails(t *testing.T) {
 	}
 }
 
+func TestCollectorDoesNotCountRoutePolicyRejectedVendor(t *testing.T) {
+	const vendorURL = "https://gemini.example/models"
+	client := &fakeExternalFetcher{responses: map[string][]fakeFetchResponse{
+		vendorURL: {{result: probe.Result{Class: probe.RoutePolicyError, Status: 400}}},
+	}}
+	got, err := (&Collector{
+		client:  client,
+		Vendors: []VendorProbeSpec{{Vendor: "gemini", URL: vendorURL, RejectBodyPatterns: []string{`(?i)user\s+location`}}},
+	}).Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := got.VendorResults["gemini"]
+	if result.SuccessCount != 0 || result.Reachable {
+		t.Fatalf("vendor=%+v, route policy rejection must not be counted as reachable", result)
+	}
+}
+
 func TestParseJSONEvidencePrefersTopLevelFieldsDeterministically(t *testing.T) {
 	const body = `{"meta":{"ip":"198.51.100.20","country":"CN"},"ip":"203.0.113.10","country":"US"}`
 	for attempt := 0; attempt < 100; attempt++ {

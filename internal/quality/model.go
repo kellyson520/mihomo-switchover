@@ -45,6 +45,7 @@ type ReportErrorCode string
 const (
 	ErrorSourceUnavailable ReportErrorCode = "source_unavailable"
 	ErrorHTTP              ReportErrorCode = "http_error"
+	ErrorRoutePolicy       ReportErrorCode = "route_policy_error"
 	ErrorDNS               ReportErrorCode = "dns_error"
 	ErrorTCP               ReportErrorCode = "tcp_error"
 	ErrorTLS               ReportErrorCode = "tls_error"

@@ -63,7 +63,14 @@ type cachedProbeResult struct {
 	CheckedAt       time.Time
 	Healthy         bool
 	FailureEligible bool
+	RouteRejected   bool
 	HintSequence    uint64
+}
+
+type probeSummary struct {
+	Healthy         bool
+	FailureEligible bool
+	RouteRejected   bool
 }
 
 type cachedPurityResult struct {
@@ -183,7 +190,15 @@ func (s *Service) RunCycle(ctx context.Context) error {
 			probeNode = mainGroup.Now
 		}
 		activeProbeKey = probeKey(s.cfg.Groups.Main, probeNode)
-		activeHealthy, sampled, failureEligible := s.activeHealthy(ctx, activeProbeKey)
+		activeHealthy, sampled, failureEligible, routeRejected := s.activeHealthy(ctx, activeProbeKey)
+		if sampled && routeRejected {
+			if replacementNode, replacement, ok := s.findCompatibleProviderNode(ctx, "main", s.cfg.Groups.Main, mainGroup, mainNode); ok {
+				mainNode = replacementNode
+				activeProbeKey = probeKey(s.cfg.Groups.Main, mainNode)
+				activeHealthy = replacement.Healthy
+				failureEligible = replacement.FailureEligible
+			}
+		}
 		mainHealthy = mainProviderHealthy && activeHealthy
 		mainFailureEligible = failureEligible
 		currentHealthySample = sampled
@@ -193,7 +208,13 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	} else if s.state.CurrentChannel == s.cfg.Groups.Backup {
 		backupNode, _ := s.ensureProvider(ctx, "backup", s.cfg.Groups.Backup, backupGroup)
 		activeProbeKey = probeKey(s.cfg.Groups.Backup, backupNode)
-		backupHealthy, _, _ = s.activeHealthy(ctx, activeProbeKey)
+		_, sampled, _, routeRejected := s.activeHealthy(ctx, activeProbeKey)
+		if sampled && routeRejected {
+			if replacementNode, _, ok := s.findCompatibleProviderNode(ctx, "backup", s.cfg.Groups.Backup, backupGroup, backupNode); ok {
+				backupNode = replacementNode
+				activeProbeKey = probeKey(s.cfg.Groups.Backup, backupNode)
+			}
+		}
 		_, mainHealthy = s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
 		// Recovery is based on a fresh main provider/delay verification. The
 		// public probe above checks the active backup route and is not the main
@@ -262,7 +283,7 @@ func (s *Service) assessPurity(ctx context.Context, key string) {
 	s.log("purity_advisory", map[string]any{"score": result.Score, "warning": result.Warning, "ip": result.IP})
 }
 
-func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool, bool) {
+func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool, bool, bool) {
 	now := s.nowUTC()
 	hintSequence := s.currentProbeHintSequence()
 	cacheInterval := s.externalProbeInterval()
@@ -270,8 +291,18 @@ func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool, bo
 		cacheInterval = s.failureRecheckInterval()
 	}
 	if s.probe.Key == key && !s.probe.CheckedAt.IsZero() && s.probe.HintSequence == hintSequence && now.Sub(s.probe.CheckedAt) < cacheInterval {
-		return s.probe.Healthy, false, s.probe.FailureEligible
+		return s.probe.Healthy, false, s.probe.FailureEligible, s.probe.RouteRejected
 	}
+	summary := s.collectCriticalProbes(ctx, false)
+	s.probe = cachedProbeResult{
+		Key: key, CheckedAt: now, Healthy: summary.Healthy,
+		FailureEligible: summary.FailureEligible, RouteRejected: summary.RouteRejected,
+		HintSequence: hintSequence,
+	}
+	return summary.Healthy, true, summary.FailureEligible, summary.RouteRejected
+}
+
+func (s *Service) collectCriticalProbes(ctx context.Context, requireAll bool) probeSummary {
 	results := make(chan probe.Result, len(s.cfg.Probes))
 	var waitGroup sync.WaitGroup
 	critical := 0
@@ -288,7 +319,7 @@ func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool, bo
 	}
 	waitGroup.Wait()
 	close(results)
-	passed, networkFailures := 0, 0
+	passed, networkFailures, routePolicyFailures := 0, 0, 0
 	for result := range results {
 		s.log("probe", map[string]any{"probe": result.ProbeID, "class": result.Class, "status": result.Status, "duration_ms": result.Duration.Milliseconds(), "error": result.Err})
 		if result.Class == probe.ReachableHTTP {
@@ -297,11 +328,20 @@ func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool, bo
 		if result.Class == probe.NetworkError {
 			networkFailures++
 		}
+		if result.Class == probe.RoutePolicyError {
+			routePolicyFailures++
+		}
 	}
 	healthy := critical > 0 && passed >= s.cfg.Decision.CriticalQuorum
-	failureEligible := critical > 0 && networkFailures >= s.cfg.Decision.CriticalQuorum
-	s.probe = cachedProbeResult{Key: key, CheckedAt: now, Healthy: healthy, FailureEligible: failureEligible, HintSequence: hintSequence}
-	return healthy, true, failureEligible
+	if requireAll {
+		healthy = critical > 0 && passed == critical
+	}
+	// An explicit vendor policy rejection is stronger than a generic HTTP
+	// response: it proves this exit cannot serve that vendor.  One such
+	// rejection is enough to re-qualify the node, while ordinary 5xx and
+	// authentication responses remain non-attributable.
+	failureEligible := critical > 0 && (routePolicyFailures > 0 || networkFailures >= s.cfg.Decision.CriticalQuorum)
+	return probeSummary{Healthy: healthy, FailureEligible: failureEligible, RouteRejected: routePolicyFailures > 0}
 }
 
 func (s *Service) externalProbeInterval() time.Duration {
@@ -383,6 +423,57 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 	s.state.ProviderLocks[provider] = state.ProviderLock{Provider: provider, Group: groupName, Node: chosen, LastVerifiedAt: s.nowUTC()}
 	s.log("node_verified", map[string]any{"provider": provider, "group": groupName, "node": chosen})
 	return chosen, true
+}
+
+// findCompatibleProviderNode is used only after an explicit route-policy
+// rejection (for example Gemini's "user location is not supported").  It
+// tests the other mihomo-verified nodes through the normal loopback proxy and
+// requires every enabled critical vendor probe to pass.  The selected group
+// may be the live group, but the channel selector is never touched here; if no
+// candidate qualifies, the original node is restored and the caller keeps its
+// existing failover decision.
+func (s *Service) findCompatibleProviderNode(ctx context.Context, provider, groupName string, group mihomo.Proxy, currentNode string) (string, probeSummary, bool) {
+	providerNodes, providerAvailable := s.providerNodes(ctx, provider)
+	if s.providerName(provider) != "" && !providerAvailable {
+		return "", probeSummary{}, false
+	}
+
+	for _, node := range group.All {
+		if node == "" || node == currentNode {
+			continue
+		}
+		if providerNodes != nil {
+			metadata, exists := providerNodes[node]
+			if !exists || !metadata.Alive || len(metadata.History) == 0 {
+				continue
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return "", probeSummary{}, false
+		}
+		if err := s.api.SetProxy(ctx, groupName, node); err != nil {
+			s.log("candidate_node_select_failed", map[string]any{"provider": provider, "group": groupName, "error": err.Error()})
+			continue
+		}
+		s.log("candidate_node_probe_started", map[string]any{"provider": provider, "group": groupName})
+		summary := s.collectCriticalProbes(ctx, true)
+		if summary.Healthy {
+			s.state.ProviderLocks[provider] = state.ProviderLock{
+				Provider: provider, Group: groupName, Node: node, LastVerifiedAt: s.nowUTC(),
+			}
+			s.log("candidate_node_verified", map[string]any{"provider": provider, "group": groupName})
+			return node, summary, true
+		}
+		s.log("candidate_node_rejected", map[string]any{"provider": provider, "group": groupName, "route_policy_rejected": summary.RouteRejected})
+	}
+
+	if currentNode != "" {
+		if err := s.api.SetProxy(ctx, groupName, currentNode); err != nil {
+			s.log("candidate_node_restore_failed", map[string]any{"provider": provider, "group": groupName, "error": err.Error()})
+		}
+	}
+	s.log("compatible_node_not_found", map[string]any{"provider": provider, "group": groupName})
+	return "", probeSummary{}, false
 }
 
 type mihomoHeartbeater interface {

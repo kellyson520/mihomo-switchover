@@ -68,6 +68,10 @@ type ProbeSpec struct {
 	ExpectedMin  int           `yaml:"expected_min"`
 	ExpectedMax  int           `yaml:"expected_max"`
 	DelayTimeout time.Duration `yaml:"-"`
+	// RejectBodyPatterns are intentionally explicit.  A reachable HTTP
+	// response is not necessarily a usable route when a vendor reports a
+	// region or policy restriction in its JSON body.
+	RejectBodyPatterns []string `yaml:"-"`
 }
 
 type PurityConfig struct {
@@ -170,15 +174,16 @@ type rawDecision struct {
 }
 
 type rawProbe struct {
-	ID           string `yaml:"id"`
-	URL          string `yaml:"url"`
-	Method       string `yaml:"method"`
-	Critical     bool   `yaml:"critical"`
-	Enabled      *bool  `yaml:"enabled"`
-	Timeout      string `yaml:"timeout"`
-	ExpectedMin  int    `yaml:"expected_min"`
-	ExpectedMax  int    `yaml:"expected_max"`
-	DelayTimeout string `yaml:"delay_timeout"`
+	ID                 string   `yaml:"id"`
+	URL                string   `yaml:"url"`
+	Method             string   `yaml:"method"`
+	Critical           bool     `yaml:"critical"`
+	Enabled            *bool    `yaml:"enabled"`
+	Timeout            string   `yaml:"timeout"`
+	ExpectedMin        int      `yaml:"expected_min"`
+	ExpectedMax        int      `yaml:"expected_max"`
+	DelayTimeout       string   `yaml:"delay_timeout"`
+	RejectBodyPatterns []string `yaml:"reject_body_patterns"`
 }
 
 type rawPurity struct {
@@ -320,7 +325,7 @@ func normalize(raw rawConfig) (Config, error) {
 	}
 
 	for _, item := range raw.Probes {
-		probe := ProbeSpec{ID: item.ID, URL: item.URL, Method: item.Method, Critical: item.Critical, Enabled: true, ExpectedMin: item.ExpectedMin, ExpectedMax: item.ExpectedMax}
+		probe := ProbeSpec{ID: item.ID, URL: item.URL, Method: item.Method, Critical: item.Critical, Enabled: true, ExpectedMin: item.ExpectedMin, ExpectedMax: item.ExpectedMax, RejectBodyPatterns: append([]string(nil), item.RejectBodyPatterns...)}
 		if item.Enabled != nil {
 			probe.Enabled = *item.Enabled
 		}
@@ -340,6 +345,14 @@ func normalize(raw rawConfig) (Config, error) {
 		}
 		if probe.ExpectedMax == 0 {
 			probe.ExpectedMax = 499
+		}
+		for index, pattern := range probe.RejectBodyPatterns {
+			if strings.TrimSpace(pattern) == "" {
+				return Config{}, fmt.Errorf("probes.%s.reject_body_patterns[%d]: pattern must not be empty", item.ID, index)
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				return Config{}, fmt.Errorf("probes.%s.reject_body_patterns[%d]: %w", item.ID, index, err)
+			}
 		}
 		cfg.Probes = append(cfg.Probes, probe)
 	}

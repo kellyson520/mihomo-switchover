@@ -83,6 +83,41 @@ func TestClassifyStatusAndNetworkErrors(t *testing.T) {
 	}
 }
 
+func TestClassifyBodyRejectsConfiguredGeminiLocationError(t *testing.T) {
+	patterns := []string{`(?i)user\s+location.*not\s+supported`}
+	if got := ClassifyBody(ReachableHTTP, []byte(`{"error":{"message":"User location is not supported for the API use."}}`), patterns); got != RoutePolicyError {
+		t.Fatalf("location rejection class=%s, want %s", got, RoutePolicyError)
+	}
+	if got := ClassifyBody(ReachableHTTP, []byte(`{"error":{"message":"Method doesn't allow unregistered callers"}}`), patterns); got != ReachableHTTP {
+		t.Fatalf("unregistered caller class=%s, want reachable HTTP", got)
+	}
+}
+
+func TestExternalClientClassifiesGeminiLocationErrorWithoutLoggingBody(t *testing.T) {
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"User location is not supported for the API use."}}`))
+	}))
+	defer proxy.Close()
+
+	client, err := NewExternalClient(proxy.URL, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := client.Check(context.Background(), config.ProbeSpec{
+		ID: "gemini", URL: "http://generativelanguage.googleapis.com/v1beta/models",
+		ExpectedMin: 200, ExpectedMax: 499,
+		RejectBodyPatterns: []string{`(?i)user\s+location.*not\s+supported`},
+	})
+	if result.Class != RoutePolicyError || result.Status != http.StatusBadRequest {
+		t.Fatalf("result=%+v, want route policy error with HTTP 400", result)
+	}
+	if strings.Contains(strings.ToLower(result.Err), "user location") || strings.Contains(strings.ToLower(result.Err), "not supported") {
+		t.Fatalf("response body leaked into operator error: %q", result.Err)
+	}
+}
+
 func TestClassifyErrorKindPreservesTypedNetworkCategories(t *testing.T) {
 	if got := classifyErrorKind(context.DeadlineExceeded); got != ErrorKindTimeout {
 		t.Fatalf("deadline kind=%s, want timeout", got)

@@ -261,6 +261,54 @@ func TestServiceKeepsCurrentHealthyProviderNodeWithoutPersistedLock(t *testing.T
 	}
 }
 
+func TestServiceReplacesGeminiRegionRejectedNodeWithDualVendorCompatibleNode(t *testing.T) {
+	api := &fakeAPI{groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "BACKUP-USA", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main", All: []string{"main"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "bad", All: []string{"bad", "good"}},
+	},
+		providers: map[string]mihomo.Provider{
+			"backup-provider": {Name: "backup-provider", Proxies: []mihomo.Proxy{
+				{Name: "bad", Alive: true, History: []mihomo.DelayHistory{{Delay: 100}}},
+				{Name: "good", Alive: true, History: []mihomo.DelayHistory{{Delay: 120}}},
+			}},
+		},
+	}
+	cfg := testServiceConfig()
+	cfg.Groups.Channel = "CHANNEL"
+	cfg.Groups.Main = "MAIN"
+	cfg.Groups.Backup = "BACKUP-USA"
+	cfg.Providers = config.ProvidersConfig{Backup: "backup-provider"}
+	cfg.Decision.RecoveriesBeforeSwitch = 99
+	cfg.Decision.ProbeInterval = time.Hour
+	cfg.Probes = append(cfg.Probes, config.ProbeSpec{
+		ID: "gemini", URL: "https://generativelanguage.googleapis.com/v1beta/models",
+		Critical: true, Enabled: true,
+	})
+	store := state.NewStore(t.TempDir()+"/state.json", "MAIN")
+	external := &nodeAwareExternal{api: api}
+	service := NewService(cfg, api, external, store, nil)
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := api.groups["BACKUP-USA"].Now; got != "good" {
+		t.Fatalf("backup node=%q, want dual-vendor compatible node good", got)
+	}
+	got, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProviderLocks["backup"].Node != "good" {
+		t.Fatalf("persisted backup lock=%+v, want good", got.ProviderLocks["backup"])
+	}
+	for _, call := range api.setCalls {
+		if call.group == "CHANNEL" {
+			t.Fatalf("candidate qualification changed total channel selector: %+v", api.setCalls)
+		}
+	}
+}
+
 type fakeExternal struct{ healthy bool }
 
 func (f fakeExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
@@ -271,6 +319,15 @@ func (f fakeExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Resu
 		result.Class = probe.NetworkError
 	}
 	return result
+}
+
+type nodeAwareExternal struct{ api *fakeAPI }
+
+func (f *nodeAwareExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
+	if spec.ID == "gemini" && f.api.groups["BACKUP-USA"].Now == "bad" {
+		return probe.Result{ProbeID: spec.ID, Class: probe.RoutePolicyError, Status: 400}
+	}
+	return probe.Result{ProbeID: spec.ID, Class: probe.ReachableHTTP, Status: 401}
 }
 
 type countingExternal struct {

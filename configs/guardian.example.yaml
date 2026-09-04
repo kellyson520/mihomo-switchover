@@ -78,6 +78,11 @@ probes:
   - id: gemini
     url: https://generativelanguage.googleapis.com/v1beta/models
     critical: true
+    # 400 + this body means the exit IP is blocked by Gemini's region policy;
+    # it is not equivalent to a normal unauthenticated 403.
+    reject_body_patterns:
+      - '(?i)user\s+location.{0,120}(not\s+supported|unsupported|not\s+available|unavailable)'
+      - '(?i)service.{0,120}(not\s+available|unavailable).{0,120}(country|region)'
   - id: anthropic
     url: https://api.anthropic.com/v1/models
     critical: false

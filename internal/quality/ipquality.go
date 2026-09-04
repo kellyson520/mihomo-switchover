@@ -51,15 +51,16 @@ type SourceSpec struct {
 // collector. Critical probes always run at least twice, even when Attempts is
 // omitted or set to one.
 type VendorProbeSpec struct {
-	ID          string
-	Vendor      string
-	URL         string
-	Method      string
-	Timeout     time.Duration
-	Attempts    int
-	Critical    bool
-	ExpectedMin int
-	ExpectedMax int
+	ID                 string
+	Vendor             string
+	URL                string
+	Method             string
+	Timeout            time.Duration
+	Attempts           int
+	Critical           bool
+	ExpectedMin        int
+	ExpectedMax        int
+	RejectBodyPatterns []string
 }
 
 // ExternalFetcher is deliberately the narrow portion of probe.ExternalClient
@@ -250,12 +251,13 @@ func (c *Collector) collectVendor(ctx context.Context, vendor VendorProbeSpec, n
 	}
 	for i := 0; i < attempts; i++ {
 		spec := config.ProbeSpec{
-			ID:          firstNonEmpty(vendor.ID, name),
-			URL:         vendor.URL,
-			Method:      firstNonEmpty(vendor.Method, "GET"),
-			Timeout:     vendor.Timeout,
-			ExpectedMin: defaultInt(vendor.ExpectedMin, 200),
-			ExpectedMax: defaultInt(vendor.ExpectedMax, 499),
+			ID:                 firstNonEmpty(vendor.ID, name),
+			URL:                vendor.URL,
+			Method:             firstNonEmpty(vendor.Method, "GET"),
+			Timeout:            vendor.Timeout,
+			ExpectedMin:        defaultInt(vendor.ExpectedMin, 200),
+			ExpectedMax:        defaultInt(vendor.ExpectedMax, 499),
+			RejectBodyPatterns: append([]string(nil), vendor.RejectBodyPatterns...),
 		}
 		fetched, _ := c.client.Fetch(ctx, spec)
 		result.LastAttemptAt = now
@@ -265,13 +267,16 @@ func (c *Collector) collectVendor(ctx context.Context, vendor VendorProbeSpec, n
 		if fetched.Duration > 0 {
 			result.LatencyMS = append(result.LatencyMS, durationMillis(fetched.Duration))
 		}
-		if strings.TrimSpace(fetched.Err) == "" && isReachableVendorStatus(fetched.Status) {
+		if fetched.Class != probe.RoutePolicyError && strings.TrimSpace(fetched.Err) == "" && isReachableVendorStatus(fetched.Status) {
 			result.SuccessCount++
 			continue
 		}
 		code := ErrorHTTP
 		message := fmt.Sprintf("HTTP status %d", fetched.Status)
-		if fetched.Status == 0 || fetched.Class == probe.NetworkError || fetched.Err != "" {
+		if fetched.Class == probe.RoutePolicyError {
+			code = ErrorRoutePolicy
+			message = "vendor route policy rejected this exit"
+		} else if fetched.Status == 0 || fetched.Class == probe.NetworkError || fetched.Err != "" {
 			code = classifyProbeResult(ctx, fetched)
 			message = fetched.Err
 		}
@@ -622,7 +627,7 @@ func VendorProbesFromConfig(probes []config.ProbeSpec) []VendorProbeSpec {
 		result = append(result, VendorProbeSpec{
 			ID: item.ID, Vendor: vendor, URL: item.URL, Method: item.Method,
 			Timeout: item.Timeout, Critical: item.Critical, ExpectedMin: item.ExpectedMin,
-			ExpectedMax: item.ExpectedMax,
+			ExpectedMax: item.ExpectedMax, RejectBodyPatterns: append([]string(nil), item.RejectBodyPatterns...),
 		})
 	}
 	return result

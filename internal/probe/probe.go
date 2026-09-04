@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,7 @@ const (
 	UpstreamHTTPError ResultClass = "upstream_http_error"
 	UnexpectedHTTP    ResultClass = "unexpected_http"
 	NetworkError      ResultClass = "network_error"
+	RoutePolicyError  ResultClass = "route_policy_error"
 )
 
 type Result struct {
@@ -286,8 +288,34 @@ func (c *ExternalClient) Fetch(ctx context.Context, spec config.ProbeSpec) (Resu
 		result.Cause = readErr
 		result.ErrorKind = ErrorKindBodyRead
 		result.Err = redactError(readErr)
+	} else {
+		result.Class = ClassifyBody(result.Class, body, spec.RejectBodyPatterns)
+		if result.Class == RoutePolicyError {
+			// Do not copy vendor response bodies into logs.  The configured
+			// pattern itself is behavior configuration and the class is enough
+			// for the decision engine to re-qualify the route.
+			result.Err = "response matched configured route policy rejection"
+		}
 	}
 	return result, body
+}
+
+// ClassifyBody upgrades a reachable HTTP response to a route policy failure
+// only when an explicitly configured pattern matches the bounded response
+// body.  Status-only responses retain their existing classification, so
+// authentication and rate-limit responses such as 401/403/429 remain useful
+// reachability evidence.
+func ClassifyBody(base ResultClass, body []byte, patterns []string) ResultClass {
+	if base != ReachableHTTP || len(body) == 0 || len(patterns) == 0 {
+		return base
+	}
+	for _, pattern := range patterns {
+		matched, err := regexp.Match(pattern, body)
+		if err == nil && matched {
+			return RoutePolicyError
+		}
+	}
+	return base
 }
 
 func ClassifyStatus(status, expectedMin, expectedMax int) ResultClass {
