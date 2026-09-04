@@ -4,7 +4,7 @@
 
 **Goal:** Make failover complete within two minutes after a corroborated first failure while preserving low normal probe frequency, safe recovery, and non-empty backup provider behavior.
 
-**Architecture:** Keep normal public probes cached at `probe_interval`; add a bounded failure-only recheck cadence. Classify transport failures separately from reachable HTTP and upstream 5xx responses, and require the configured critical quorum plus a verified backup node. Keep provider health refresh on its own recovery cadence and make provider-filter validation fail closed before deployment.
+**Architecture:** Subscribe to mihomo's local `/logs?level=error` WebSocket as a non-blocking hint source, keep normal public probes cached at `probe_interval`, and add a bounded failure-only recheck cadence. Classify transport failures separately from reachable HTTP and upstream 5xx responses, and require the configured critical quorum plus a verified backup node. Keep provider health refresh on its own recovery cadence and make provider-filter validation fail closed before deployment.
 
 **Tech Stack:** Go 1.24, standard `net/http`/`context`, YAML v3, Python deployment helpers, Go/Python tests, Docker static build.
 
@@ -32,7 +32,30 @@ git add internal/config/config.go internal/config/config_test.go configs/guardia
 git commit -m "feat: configure fast failure and recovery checks"
 ```
 
-### Task 2: Implement bounded fast failure confirmation
+### Task 2: Subscribe to mihomo error logs without coupling the guardian loop
+
+**Files:** `internal/mihomo/client.go`, create `internal/mihomo/logstream.go`, `internal/mihomo/logstream_test.go`, `internal/runtime/service.go`, `internal/runtime/service_test.go`, `cmd/guardian/main.go`
+
+- [ ] **Step 1: Write failing tests.** Add a WebSocket test server that validates the Authorization header and Upgrade request, sends a text frame containing a mihomo `Log` payload, and closes the connection. Assert the client extracts only a classified network-error hint and does not return the raw payload. Add a reconnect test and a service test showing a network log hint invalidates a healthy five-minute probe cache, while provider/filter/config error text does not.
+- [ ] **Step 2: Run RED.**
+
+```bash
+go test ./internal/mihomo ./internal/runtime -run '(Log|Hint)' -count=1
+```
+
+Expected: failure because no log-stream client or service hint method exists.
+- [ ] **Step 3: Implement the minimal stream client.** Add a standard-library WebSocket handshake and frame reader/writer sufficient for RFC 6455 text, ping/pong, close, and bounded payloads. Connect to `/logs?level=error` over the already validated loopback controller, send the bearer token, reconnect with capped backoff, and return on context cancellation. Parse Mihomo log envelopes and classify only network-related error messages; never return or log the raw message.
+- [ ] **Step 4: Add the service hint boundary.** Add a mutex-protected hint timestamp/classification. `ObserveMihomoError` invalidates the active public-probe cache only for network-related classes and records a rate-limited `mihomo_error_hint` event with category only. The service remains safe if the stream is unavailable.
+- [ ] **Step 5: Start the watcher from `executeRun`.** Run it in a goroutine after the startup heartbeat. Stream errors are logged as a throttled diagnostic event and do not return from `executeRun` or stop the guardian loop.
+- [ ] **Step 6: Run focused tests and commit.**
+
+```bash
+go test ./internal/mihomo ./internal/runtime ./cmd/guardian -count=1
+git add internal/mihomo internal/runtime/service_test.go cmd/guardian/main.go
+git commit -m "feat: use mihomo errors as fast probe hints"
+```
+
+### Task 3: Implement bounded fast failure confirmation
 
 **Files:** `internal/runtime/service.go`, `internal/runtime/service_test.go`, `internal/probe/probe_test.go`, `README.md`
 
@@ -60,7 +83,7 @@ git add internal/runtime/service.go internal/runtime/service_test.go internal/pr
 git commit -m "fix: confirm route failures within bounded window"
 ```
 
-### Task 3: Isolate provider recovery healthchecks
+### Task 4: Isolate provider recovery healthchecks
 
 **Files:** `internal/runtime/service.go`, `internal/runtime/service_test.go`, `docs/configuration.md`
 
@@ -81,7 +104,7 @@ git add internal/runtime/service.go internal/runtime/service_test.go docs/config
 git commit -m "fix: isolate provider recovery healthcheck cadence"
 ```
 
-### Task 4: Guard backup provider filters before deployment
+### Task 5: Guard backup provider filters before deployment
 
 **Files:** create `scripts/provider_filter_guard.py` and `tests/test_provider_filter_guard.py`; modify `scripts/install.sh` and `docs/configuration.md`
 
@@ -110,7 +133,7 @@ git add scripts/provider_filter_guard.py tests/test_provider_filter_guard.py scr
 git commit -m "fix: reject empty backup provider filters before deploy"
 ```
 
-### Task 5: Apply and verify production safely
+### Task 6: Apply and verify production safely
 
 **Files:** production `/opt/mihomo-cliproxy/config/config.yaml` and mounted `/opt/mihomo-cliproxy/guardian/bin/guardian`
 
