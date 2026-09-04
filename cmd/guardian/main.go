@@ -357,6 +357,11 @@ func executeRun(args runArgs) error {
 	if err := api.Heartbeat(startupCtx); err != nil {
 		return fmt.Errorf("mihomo API unavailable at startup: %w", err)
 	}
+	go func() {
+		if err := api.WatchErrorLogs(ctx, service.ObserveMihomoError); err != nil && ctx.Err() == nil {
+			_ = logger.Event("mihomo_log_stream_failed", map[string]any{"error": err.Error()})
+		}
+	}()
 	return runtime.NewRuntime(link, runtime.RuntimeConfig{LinkLossGrace: cfg.Decision.LinkLossGrace, Tick: cfg.Reload.CheckInterval}).Run(ctx)
 }
 

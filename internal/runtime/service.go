@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"mihomo-guardian/internal/config"
@@ -52,12 +53,17 @@ type Service struct {
 	probe                cachedProbeResult
 	purity               cachedPurityResult
 	providerHealthChecks map[string]time.Time
+	clock                func() time.Time
+	hintMu               sync.Mutex
+	probeHintSequence    uint64
 }
 
 type cachedProbeResult struct {
-	Key       string
-	CheckedAt time.Time
-	Healthy   bool
+	Key             string
+	CheckedAt       time.Time
+	Healthy         bool
+	FailureEligible bool
+	HintSequence    uint64
 }
 
 type cachedPurityResult struct {
@@ -84,6 +90,33 @@ func NewServiceWithQualityStore(cfg config.Config, api API, external ExternalPro
 func (s *Service) SetQualityStore(store *quality.Store) {
 	s.quality = store
 	s.recs = nil
+}
+
+func (s *Service) nowUTC() time.Time {
+	if s.clock != nil {
+		return s.clock().UTC()
+	}
+	return time.Now().UTC()
+}
+
+// ObserveMihomoError accepts only the redacted category emitted by the
+// mihomo log watcher. A network hint invalidates the current public probe
+// cache, but never creates a switch action by itself.
+func (s *Service) ObserveMihomoError(hint mihomo.LogHint) {
+	if hint.Category != mihomo.LogHintNetwork {
+		return
+	}
+	s.hintMu.Lock()
+	s.probeHintSequence++
+	sequence := s.probeHintSequence
+	s.hintMu.Unlock()
+	s.log("mihomo_error_hint", map[string]any{"category": string(hint.Category), "sequence": sequence})
+}
+
+func (s *Service) currentProbeHintSequence() uint64 {
+	s.hintMu.Lock()
+	defer s.hintMu.Unlock()
+	return s.probeHintSequence
 }
 
 func newDecisionEngine(cfg config.Config) *decision.Engine {
@@ -140,13 +173,19 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	}
 
 	mainHealthy, backupHealthy := false, false
+	mainFailureEligible := false
 	currentHealthySample := false
 	activeProbeKey := ""
 	if s.state.CurrentChannel == s.cfg.Groups.Main {
-		mainNode, _ := s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
-		activeProbeKey = probeKey(s.cfg.Groups.Main, mainNode)
-		activeHealthy, sampled := s.activeHealthy(ctx, activeProbeKey)
-		mainHealthy = activeHealthy
+		mainNode, mainProviderHealthy := s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
+		probeNode := mainNode
+		if probeNode == "" {
+			probeNode = mainGroup.Now
+		}
+		activeProbeKey = probeKey(s.cfg.Groups.Main, probeNode)
+		activeHealthy, sampled, failureEligible := s.activeHealthy(ctx, activeProbeKey)
+		mainHealthy = mainProviderHealthy && activeHealthy
+		mainFailureEligible = failureEligible
 		currentHealthySample = sampled
 		if !activeHealthy {
 			_, backupHealthy = s.ensureProvider(ctx, "backup", s.cfg.Groups.Backup, backupGroup)
@@ -154,7 +193,7 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	} else if s.state.CurrentChannel == s.cfg.Groups.Backup {
 		backupNode, _ := s.ensureProvider(ctx, "backup", s.cfg.Groups.Backup, backupGroup)
 		activeProbeKey = probeKey(s.cfg.Groups.Backup, backupNode)
-		backupHealthy, _ = s.activeHealthy(ctx, activeProbeKey)
+		backupHealthy, _, _ = s.activeHealthy(ctx, activeProbeKey)
 		_, mainHealthy = s.ensureProvider(ctx, "main", s.cfg.Groups.Main, mainGroup)
 		// Recovery is based on a fresh main provider/delay verification. The
 		// public probe above checks the active backup route and is not the main
@@ -166,10 +205,11 @@ func (s *Service) RunCycle(ctx context.Context) error {
 	s.assessPurity(ctx, activeProbeKey)
 
 	action := s.engine.Evaluate(s.state, decision.Input{
-		CurrentHealthy:       mainHealthy,
-		CurrentHealthySample: currentHealthySample,
-		BackupHealthy:        backupHealthy,
-		Now:                  time.Now(),
+		CurrentHealthy:         mainHealthy,
+		CurrentHealthySample:   currentHealthySample,
+		CurrentFailureEligible: mainFailureEligible,
+		BackupHealthy:          backupHealthy,
+		Now:                    s.nowUTC(),
 	})
 	if s.cfg.Decision.Mode == "observe" && action.Kind == decision.SwitchChannel {
 		s.log("switch_observed", map[string]any{"channel": action.Channel, "reason": action.Reason})
@@ -222,27 +262,46 @@ func (s *Service) assessPurity(ctx context.Context, key string) {
 	s.log("purity_advisory", map[string]any{"score": result.Score, "warning": result.Warning, "ip": result.IP})
 }
 
-func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool) {
-	now := time.Now().UTC()
-	if s.probe.Key == key && !s.probe.CheckedAt.IsZero() && now.Sub(s.probe.CheckedAt) < s.externalProbeInterval() {
-		return s.probe.Healthy, false
+func (s *Service) activeHealthy(ctx context.Context, key string) (bool, bool, bool) {
+	now := s.nowUTC()
+	hintSequence := s.currentProbeHintSequence()
+	cacheInterval := s.externalProbeInterval()
+	if !s.probe.Healthy {
+		cacheInterval = s.failureRecheckInterval()
 	}
-	passed := 0
+	if s.probe.Key == key && !s.probe.CheckedAt.IsZero() && s.probe.HintSequence == hintSequence && now.Sub(s.probe.CheckedAt) < cacheInterval {
+		return s.probe.Healthy, false, s.probe.FailureEligible
+	}
+	results := make(chan probe.Result, len(s.cfg.Probes))
+	var waitGroup sync.WaitGroup
 	critical := 0
 	for _, item := range s.cfg.Probes {
 		if !item.Enabled || !item.Critical {
 			continue
 		}
 		critical++
-		result := s.external.Check(ctx, item)
-		s.log("probe", map[string]any{"probe": item.ID, "class": result.Class, "status": result.Status, "duration_ms": result.Duration.Milliseconds(), "error": result.Err})
+		waitGroup.Add(1)
+		go func(spec config.ProbeSpec) {
+			defer waitGroup.Done()
+			results <- s.external.Check(ctx, spec)
+		}(item)
+	}
+	waitGroup.Wait()
+	close(results)
+	passed, networkFailures := 0, 0
+	for result := range results {
+		s.log("probe", map[string]any{"probe": result.ProbeID, "class": result.Class, "status": result.Status, "duration_ms": result.Duration.Milliseconds(), "error": result.Err})
 		if result.Class == probe.ReachableHTTP {
 			passed++
 		}
+		if result.Class == probe.NetworkError {
+			networkFailures++
+		}
 	}
 	healthy := critical > 0 && passed >= s.cfg.Decision.CriticalQuorum
-	s.probe = cachedProbeResult{Key: key, CheckedAt: now, Healthy: healthy}
-	return healthy, true
+	failureEligible := critical > 0 && networkFailures >= s.cfg.Decision.CriticalQuorum
+	s.probe = cachedProbeResult{Key: key, CheckedAt: now, Healthy: healthy, FailureEligible: failureEligible, HintSequence: hintSequence}
+	return healthy, true, failureEligible
 }
 
 func (s *Service) externalProbeInterval() time.Duration {
@@ -250,6 +309,13 @@ func (s *Service) externalProbeInterval() time.Duration {
 		return s.cfg.Decision.ProbeInterval
 	}
 	return 5 * time.Minute
+}
+
+func (s *Service) failureRecheckInterval() time.Duration {
+	if s.cfg.Decision.FailureRecheckInterval > 0 {
+		return s.cfg.Decision.FailureRecheckInterval
+	}
+	return 30 * time.Second
 }
 
 func probeKey(group, node string) string {
@@ -314,7 +380,7 @@ func (s *Service) ensureProvider(ctx context.Context, provider, groupName string
 			return "", false
 		}
 	}
-	s.state.ProviderLocks[provider] = state.ProviderLock{Provider: provider, Group: groupName, Node: chosen, LastVerifiedAt: time.Now().UTC()}
+	s.state.ProviderLocks[provider] = state.ProviderLock{Provider: provider, Group: groupName, Node: chosen, LastVerifiedAt: s.nowUTC()}
 	s.log("node_verified", map[string]any{"provider": provider, "group": groupName, "node": chosen})
 	return chosen, true
 }
@@ -381,7 +447,7 @@ func (s *Service) qualityReplacement(ctx context.Context, provider, groupName, s
 	if !ok {
 		return "", false
 	}
-	now := time.Now().UTC()
+	now := s.nowUTC()
 	maxAge := s.cfg.Quality.FullScanInterval
 	if maxAge <= 0 {
 		maxAge = 720 * time.Hour
@@ -561,7 +627,11 @@ func (s *Service) requestProviderHealthCheck(ctx context.Context, provider strin
 		s.providerHealthChecks = make(map[string]time.Time)
 	}
 	now := time.Now().UTC()
-	if last, exists := s.providerHealthChecks[provider]; exists && now.Sub(last) < s.externalProbeInterval() {
+	interval := s.cfg.Decision.RecoveryHealthcheckInterval
+	if interval <= 0 {
+		interval = 2 * time.Minute
+	}
+	if last, exists := s.providerHealthChecks[provider]; exists && now.Sub(last) < interval {
 		return
 	}
 	// Mark before the request so an API error cannot turn a 15-second guardian

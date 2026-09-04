@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,6 +258,161 @@ func TestServiceCachesPublicProbeDuringProbeInterval(t *testing.T) {
 	if external.checks != 1 {
 		t.Fatalf("public probe checks=%d, want one fresh check within interval", external.checks)
 	}
+}
+
+func TestServiceUsesFastFailureRechecksAfterFirstFailure(t *testing.T) {
+	api := &fakeAPI{groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main", All: []string{"main"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup", All: []string{"backup"}},
+	}, delays: map[string]error{}}
+	external := &countingResultExternal{class: probe.NetworkError}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{}
+	cfg.Decision.ProbeInterval = time.Hour
+	cfg.Decision.FailureRecheckInterval = 30 * time.Second
+	cfg.Decision.FailuresBeforeSwitch = 3
+	cfg.Decision.MinHold = 0
+	cfg.Probes = append(cfg.Probes, config.ProbeSpec{ID: "gemini", URL: "https://gemini.example/health", Critical: true, Enabled: true})
+	store := state.NewStore(t.TempDir()+"/state.json", "MAIN")
+	service := NewService(cfg, api, external, store, nil)
+	clock := time.Unix(1000, 0).UTC()
+	service.clock = func() time.Time { return clock }
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.Count() != 2 {
+		t.Fatalf("first probe count=%d, want 2", external.Count())
+	}
+	clock = clock.Add(15 * time.Second)
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.Count() != 2 {
+		t.Fatalf("cached failure was probed again at 15s: count=%d", external.Count())
+	}
+	clock = clock.Add(15 * time.Second)
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.Count() != 4 {
+		t.Fatalf("first fast recheck count=%d, want 4", external.Count())
+	}
+	clock = clock.Add(30 * time.Second)
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if api.groups["CHANNEL"].Now != "BACKUP-USA" {
+		t.Fatalf("channel=%q, want BACKUP-USA after three fresh failures", api.groups["CHANNEL"].Now)
+	}
+}
+
+func TestServiceMihomoNetworkHintInvalidatesHealthyProbeCache(t *testing.T) {
+	api := &fakeAPI{groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main", All: []string{"main"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup", All: []string{"backup"}},
+	}, delays: map[string]error{}}
+	external := &countingResultExternal{class: probe.ReachableHTTP}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{}
+	cfg.Decision.ProbeInterval = time.Hour
+	cfg.Probes = append(cfg.Probes, config.ProbeSpec{ID: "gemini", URL: "https://gemini.example/health", Critical: true, Enabled: true})
+	store := state.NewStore(t.TempDir()+"/state.json", "MAIN")
+	service := NewService(cfg, api, external, store, nil)
+	clock := time.Unix(2000, 0).UTC()
+	service.clock = func() time.Time { return clock }
+
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.Count() != 2 {
+		t.Fatalf("initial probe count=%d, want 2", external.Count())
+	}
+	service.ObserveMihomoError(mihomo.LogHint{Category: mihomo.LogHintNetwork})
+	clock = clock.Add(15 * time.Second)
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.Count() != 4 {
+		t.Fatalf("network hint did not invalidate cache: count=%d", external.Count())
+	}
+	service.ObserveMihomoError(mihomo.LogHint{Category: mihomo.LogHintNone})
+	clock = clock.Add(15 * time.Second)
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if external.Count() != 4 {
+		t.Fatalf("non-network hint caused another probe: count=%d", external.Count())
+	}
+}
+
+func TestServiceRunsCriticalProbesConcurrently(t *testing.T) {
+	api := &fakeAPI{groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main", All: []string{"main"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup", All: []string{"backup"}},
+	}, delays: map[string]error{}}
+	external := newBarrierExternal(2)
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{}
+	cfg.Decision.ProbeInterval = time.Hour
+	cfg.Probes = append(cfg.Probes, config.ProbeSpec{ID: "gemini", URL: "https://gemini.example/health", Critical: true, Enabled: true})
+	service := NewService(cfg, api, external, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil)
+
+	done := make(chan error, 1)
+	go func() { done <- service.RunCycle(context.Background()) }()
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		select {
+		case id := <-external.entered:
+			seen[id] = true
+		case <-time.After(time.Second):
+			t.Fatal("critical probes were not started concurrently")
+		}
+	}
+	close(external.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 {
+		t.Fatalf("probe ids=%v, want two distinct probes", seen)
+	}
+}
+
+type countingResultExternal struct {
+	mu    sync.Mutex
+	count int
+	class probe.ResultClass
+}
+
+func (f *countingResultExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
+	f.mu.Lock()
+	f.count++
+	f.mu.Unlock()
+	return probe.Result{ProbeID: spec.ID, Class: f.class}
+}
+
+func (f *countingResultExternal) Count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.count
+}
+
+type barrierExternal struct {
+	entered chan string
+	release chan struct{}
+}
+
+func newBarrierExternal(size int) *barrierExternal {
+	return &barrierExternal{entered: make(chan string, size), release: make(chan struct{})}
+}
+
+func (f *barrierExternal) Check(_ context.Context, spec config.ProbeSpec) probe.Result {
+	f.entered <- spec.ID
+	<-f.release
+	return probe.Result{ProbeID: spec.ID, Class: probe.ReachableHTTP}
 }
 
 func TestServiceSwitchesToVerifiedStickyBackup(t *testing.T) {

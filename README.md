@@ -61,9 +61,12 @@ sudo ./scripts/install.sh
 按 `probe_interval` 请求 mihomo 原生 `/providers/proxies/<provider>/healthcheck`，
 让备用运行期间的主渠道健康证据能够恢复；该请求不切换 `CHANNEL`。
 
-主循环默认每 15 秒运行，但 OpenAI、Gemini 等公网厂商探测默认每 5 分钟刷新一次；
-缓存期间不会重复访问厂商，也不会重复累计同一个失败。修改 `decision.probe_interval`
-可热重载调整该频率，生产建议不要低于 5 分钟。
+主循环默认每 15 秒运行，但 OpenAI、Gemini 等公网厂商在正常状态下默认每 5 分钟刷新
+一次；Mihomo 的本地 error 日志流遇到网络拨号、TLS、超时或连接重置时，会立即打破这次
+缓存并进入有界快速复核。故障窗口内按 `failure_recheck_interval`（默认 30 秒）取得
+新样本，缓存期间不会重复访问厂商，也不会重复累计同一个失败。修改
+`decision.probe_interval` 可热重载调整正常频率，修改 `decision.failure_recheck_interval`
+可调整故障确认周期；日志提示本身永远不会直接切换渠道。
 
 ## 运维命令
 

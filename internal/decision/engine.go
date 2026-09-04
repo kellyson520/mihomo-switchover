@@ -22,12 +22,13 @@ type DecisionConfig struct {
 }
 
 type Input struct {
-	CurrentHealthy       bool
-	CurrentHealthySample bool
-	BackupHealthy        bool
-	BackupNode           string
-	PurityWarning        string
-	Now                  time.Time
+	CurrentHealthy         bool
+	CurrentHealthySample   bool
+	CurrentFailureEligible bool
+	BackupHealthy          bool
+	BackupNode             string
+	PurityWarning          string
+	Now                    time.Time
 }
 
 type Candidate struct {
@@ -93,6 +94,10 @@ func (e *Engine) Evaluate(current state.State, input Input) Action {
 		if input.CurrentHealthy {
 			current.FailureStreak = 0
 			return Action{Kind: Noop, Reason: "main healthy", State: current}
+		}
+		if !input.CurrentFailureEligible {
+			current.FailureStreak = 0
+			return Action{Kind: Noop, Reason: "main failure is not attributable to route", State: current}
 		}
 		current.FailureStreak++
 		if current.FailureStreak < e.cfg.FailuresBeforeSwitch {

@@ -192,7 +192,12 @@ GET /providers/proxies/<provider>
 和号池风控风险。若没有 provider 配置，guardian 才使用 mihomo 的节点 delay API
 验证候选；该检查不会把候选临时切入生产流量。
 
-当 provider 已配置但候选暂时未验证时，guardian 会调用 mihomo 的：
+guardian 同时订阅 mihomo controller 的 `/logs?level=error` 日志流。日志中的网络拨号、
+连接、TLS、超时和重置错误只用于立即打破公网探测缓存，随后仍需关键厂商 quorum 和
+mihomo provider 健康证据确认；provider 拉取、过滤器和配置错误不会直接触发切换。日志
+流断开时自动退避重连，失败不影响 mihomo 或 guardian 主循环。
+
+当 provider 已配置但候选暂时未验证时，guardian 还会调用 mihomo 的：
 
 ```text
 GET /providers/proxies/<provider>/healthcheck
@@ -272,7 +277,7 @@ IP 身份一致和最低置信度。阈值、保留期和 target 顺序可热重
 | `mode` | `auto` | `observe` 只记录应切换动作，`auto` 才执行自动切换。`force` 仅为兼容保留，日常生产不要设置；人工强制状态由 `switch` 命令写入状态文件。首次部署应使用 `observe`。 |
 | `interval` | `15s` | guardian 主循环和 mihomo 本地健康检查周期；保持较短以便快速处理本地状态。 |
 | `probe_interval` | `5m` | 正常状态下 OpenAI、Gemini 等公网厂商探测及纯净度查询的最短刷新间隔。相同渠道/节点在缓存期间不重复访问公网；切换到新节点会立即刷新。 |
-| `failure_recheck_interval` | `30s` | 仅在最近一次关键探测不健康时启用的快速复核间隔；不改变正常探测频率。 |
+| `failure_recheck_interval` | `30s` | 仅在最近一次关键探测不健康或收到 Mihomo 网络错误日志后启用的快速复核间隔；不改变正常探测频率。 |
 | `recovery_healthcheck_interval` | `2m` | 备用运行期间请求 mihomo 原生 provider healthcheck 的最短间隔；不直接切换渠道。 |
 | `failures_before_switch` | `3` | 当前渠道连续失败次数达到该值才允许切换。 |
 | `recoveries_before_switch` | `2` | 当前在备用渠道时，主渠道恢复确认所需的连续成功次数。 |
@@ -360,7 +365,7 @@ docker exec mihomo-cliproxy /guardian/bin/guardian quality run \
 重启 guardian 才能让新的 logger 参数生效。`reload.check_interval` 控制配置文件检查
 频率，可热重载。
 
-常用事件包括 `probe`、`purity_advisory`、`node_verified`、`provider_unverified`、
+常用事件包括 `probe`、`mihomo_error_hint`、`mihomo_log_stream_failed`、`purity_advisory`、`node_verified`、`provider_unverified`、
 `provider_healthcheck_requested`、`provider_healthcheck_failed`、
 `switch_observed`、`channel_switched`、`quality_stability_node_complete`、
 `quality_stability_identity_missing`、`quality_stability_summary_failed`、

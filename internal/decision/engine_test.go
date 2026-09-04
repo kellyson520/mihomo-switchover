@@ -10,7 +10,7 @@ import (
 func TestDecisionSwitchesOnlyAfterThreeCorroboratedFailures(t *testing.T) {
 	e := NewEngine(DecisionConfig{FailuresBeforeSwitch: 3, RecoveriesBeforeSwitch: 2, MinHold: 0})
 	current := state.Default("MAIN")
-	input := Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, BackupNode: "backup-1", Now: time.Unix(100, 0)}
+	input := Input{CurrentHealthy: false, CurrentHealthySample: true, CurrentFailureEligible: true, BackupHealthy: true, BackupNode: "backup-1", Now: time.Unix(100, 0)}
 	for i := 1; i <= 2; i++ {
 		action := e.Evaluate(current, input)
 		if action.Kind != Noop {
@@ -36,30 +36,44 @@ func TestDecisionDoesNotCountCachedHealthAsANewFailure(t *testing.T) {
 	current := state.Default("MAIN")
 	now := time.Unix(100, 0)
 
-	first := e.Evaluate(current, Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, Now: now})
+	first := e.Evaluate(current, Input{CurrentHealthy: false, CurrentHealthySample: true, CurrentFailureEligible: true, BackupHealthy: true, Now: now})
 	if first.Kind != Noop || first.State.FailureStreak != 1 {
 		t.Fatalf("first failed sample=%+v", first)
 	}
 
-	cached := e.Evaluate(first.State, Input{CurrentHealthy: false, CurrentHealthySample: false, BackupHealthy: true, Now: now.Add(15 * time.Second)})
+	cached := e.Evaluate(first.State, Input{CurrentHealthy: false, CurrentHealthySample: false, CurrentFailureEligible: true, BackupHealthy: true, Now: now.Add(15 * time.Second)})
 	if cached.Kind != Noop || cached.State.FailureStreak != 1 {
 		t.Fatalf("cached failure was counted again=%+v", cached)
 	}
 
-	second := e.Evaluate(cached.State, Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, Now: now.Add(5 * time.Minute)})
+	second := e.Evaluate(cached.State, Input{CurrentHealthy: false, CurrentHealthySample: true, CurrentFailureEligible: true, BackupHealthy: true, Now: now.Add(5 * time.Minute)})
 	if second.Kind != Noop || second.State.FailureStreak != 2 {
 		t.Fatalf("second failed sample=%+v", second)
 	}
 
-	third := e.Evaluate(second.State, Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: true, Now: now.Add(10 * time.Minute)})
+	third := e.Evaluate(second.State, Input{CurrentHealthy: false, CurrentHealthySample: true, CurrentFailureEligible: true, BackupHealthy: true, Now: now.Add(10 * time.Minute)})
 	if third.Kind != SwitchChannel || third.Channel != "BACKUP-USA" {
 		t.Fatalf("third failed sample=%+v", third)
 	}
 }
 
+func TestDecisionDoesNotCountNonRouteFailure(t *testing.T) {
+	e := NewEngine(DecisionConfig{FailuresBeforeSwitch: 1, RecoveriesBeforeSwitch: 2, MinHold: 0})
+	action := e.Evaluate(state.Default("MAIN"), Input{
+		CurrentHealthy:         false,
+		CurrentHealthySample:   true,
+		CurrentFailureEligible: false,
+		BackupHealthy:          true,
+		Now:                    time.Unix(100, 0),
+	})
+	if action.Kind != Noop || action.State.FailureStreak != 0 {
+		t.Fatalf("non-route failure changed decision state: %+v", action)
+	}
+}
+
 func TestNoVerifiedBackupNeverSwitches(t *testing.T) {
 	action := NewEngine(DecisionConfig{FailuresBeforeSwitch: 1}).Evaluate(
-		state.Default("MAIN"), Input{CurrentHealthy: false, CurrentHealthySample: true, BackupHealthy: false, Now: time.Unix(100, 0)})
+		state.Default("MAIN"), Input{CurrentHealthy: false, CurrentHealthySample: true, CurrentFailureEligible: true, BackupHealthy: false, Now: time.Unix(100, 0)})
 	if action.Kind != Noop {
 		t.Fatalf("action=%s", action.Kind)
 	}
