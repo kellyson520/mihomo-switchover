@@ -59,7 +59,7 @@ git commit -m "feat: use mihomo errors as fast probe hints"
 
 **Files:** `internal/runtime/service.go`, `internal/runtime/service_test.go`, `internal/probe/probe_test.go`, `README.md`
 
-- [ ] **Step 1: Write the failing tests.** Use two critical probes and a counting fake. With a one-hour normal interval and 30-second failure interval, return two network failures at t=0, call a second cycle at t=15s and assert no new checks/streak remains 1, then call at t=30s and assert a new sample/streak 2, and t=60s assert the third sample can switch to a verified backup. Add a blocking fake proving the two critical probes run concurrently. Add classification assertions that 401/403/429 are reachable, 503 is `UpstreamHTTPError`, and only `NetworkError` is route-failure evidence.
+- [ ] **Step 1: Write the failing tests.** Use two critical probes and a counting fake. With a one-hour normal interval and 30-second failure interval, return two network failures at t=0, call a second cycle at t=15s and assert no new checks/streak remains 1, then call at t=30s and assert a new sample/streak 2, and t=60s assert the third sample can switch to a verified backup. Add a blocking fake proving the two critical probes run concurrently. Add classification assertions that 401/403/429 are reachable, 503 is `UpstreamHTTPError`, and only `NetworkError` produces `FailureEligible=true`; an all-503 sample must keep the failure streak unchanged.
 - [ ] **Step 2: Run the focused tests and verify RED.**
 
 ```bash
@@ -68,7 +68,7 @@ go test ./internal/runtime ./internal/probe -run 'Test(Service|Classify).*' -cou
 
 Expected: failure because the service has no failure-only cadence or concurrent probe collection.
 
-- [ ] **Step 3: Implement the minimal behavior.** Keep healthy results cached for `ProbeInterval`; when the cached result is unhealthy, use `FailureRecheckInterval`, so an unhealthy result is counted only once per fresh interval. Run enabled critical probes concurrently, count `ReachableHTTP` as pass, retain transport-failure evidence, and do not treat upstream 5xx as node failure. Use an injectable service clock for timestamps and decision time. When provider resolution returns no node, derive the probe key from the current group node, and require main provider verification together with the public result before calling main healthy.
+- [ ] **Step 3: Implement the minimal behavior.** Keep healthy results cached for `ProbeInterval`; when the cached result is unhealthy, use `FailureRecheckInterval`, so an unhealthy result is counted only once per fresh interval. Run enabled critical probes concurrently, count `ReachableHTTP` as pass, retain transport-failure evidence, and pass a separate `FailureEligible` boolean into the decision engine; upstream 5xx and unexpected HTTP responses do not make that boolean true. Use an injectable service clock for timestamps and decision time. When provider resolution returns no node, derive the probe key from the current group node, and require main provider verification together with the public result before calling main healthy.
 - [ ] **Step 4: Run focused tests and verify GREEN.**
 
 ```bash
