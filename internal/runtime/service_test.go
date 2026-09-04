@@ -141,6 +141,66 @@ func TestServiceTriggersNativeProviderHealthCheckForUnverifiedProvider(t *testin
 	}
 }
 
+func TestServiceUsesIndependentRecoveryHealthcheckInterval(t *testing.T) {
+	api := &fakeAPI{
+		groups: map[string]mihomo.Proxy{
+			"MAIN": {Name: "MAIN", Now: "main-current", All: []string{"main-current"}},
+		},
+		providers: map[string]mihomo.Provider{
+			"main-provider": {Name: "main-provider", Proxies: []mihomo.Proxy{{Name: "main-current", Alive: false, History: []mihomo.DelayHistory{{Delay: 0}}}}},
+		},
+	}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{Main: "main-provider"}
+	cfg.Decision.RecoveryHealthcheckInterval = 2 * time.Minute
+	service := NewService(cfg, api, fakeExternal{healthy: false}, state.NewStore(t.TempDir()+"/state.json", "MAIN"), nil)
+	clock := time.Unix(3000, 0).UTC()
+	service.clock = func() time.Time { return clock }
+
+	_, healthy := service.ensureProvider(context.Background(), "main", cfg.Groups.Main, api.groups[cfg.Groups.Main])
+	if healthy {
+		t.Fatal("unverified provider was accepted")
+	}
+	clock = clock.Add(time.Minute)
+	_, _ = service.ensureProvider(context.Background(), "main", cfg.Groups.Main, api.groups[cfg.Groups.Main])
+	if len(api.healthCheckCalls) != 1 {
+		t.Fatalf("healthcheck calls=%v, want one inside interval", api.healthCheckCalls)
+	}
+	clock = clock.Add(time.Minute)
+	_, _ = service.ensureProvider(context.Background(), "main", cfg.Groups.Main, api.groups[cfg.Groups.Main])
+	if len(api.healthCheckCalls) != 2 {
+		t.Fatalf("healthcheck calls=%v, want second call after interval", api.healthCheckCalls)
+	}
+}
+
+func TestServiceDoesNotSwitchOnUpstreamHTTPFailures(t *testing.T) {
+	api := &fakeAPI{groups: map[string]mihomo.Proxy{
+		"CHANNEL":    {Name: "CHANNEL", Now: "MAIN", All: []string{"MAIN", "BACKUP-USA"}},
+		"MAIN":       {Name: "MAIN", Now: "main", All: []string{"main"}},
+		"BACKUP-USA": {Name: "BACKUP-USA", Now: "backup", All: []string{"backup"}},
+	}, delays: map[string]error{}}
+	cfg := testServiceConfig()
+	cfg.Providers = config.ProvidersConfig{}
+	cfg.Decision.FailuresBeforeSwitch = 1
+	cfg.Decision.ProbeInterval = time.Second
+	external := &countingResultExternal{class: probe.UpstreamHTTPError}
+	store := state.NewStore(t.TempDir()+"/state.json", "MAIN")
+	service := NewService(cfg, api, external, store, nil)
+	if err := service.RunCycle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if api.groups["CHANNEL"].Now != "MAIN" {
+		t.Fatalf("upstream HTTP failure triggered channel switch: %q", api.groups["CHANNEL"].Now)
+	}
+	stateValue, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stateValue.FailureStreak != 0 {
+		t.Fatalf("upstream HTTP failure changed failure streak: %d", stateValue.FailureStreak)
+	}
+}
+
 func TestServiceReturnsToMainAfterNativeProviderHealthCheckRecoversIt(t *testing.T) {
 	api := &fakeAPI{
 		groups: map[string]mihomo.Proxy{

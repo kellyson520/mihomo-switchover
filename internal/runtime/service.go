@@ -626,7 +626,7 @@ func (s *Service) requestProviderHealthCheck(ctx context.Context, provider strin
 	if s.providerHealthChecks == nil {
 		s.providerHealthChecks = make(map[string]time.Time)
 	}
-	now := time.Now().UTC()
+	now := s.nowUTC()
 	interval := s.cfg.Decision.RecoveryHealthcheckInterval
 	if interval <= 0 {
 		interval = 2 * time.Minute

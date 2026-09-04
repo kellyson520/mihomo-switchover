@@ -152,6 +152,7 @@ PY
 }
 DISCOVERED_MAIN_PROVIDER=$(json_list_value "providers.$DISCOVERED_MAIN" || true)
 DISCOVERED_BACKUP_PROVIDER=$(json_list_value "providers.$DISCOVERED_BACKUP" || true)
+DISCOVERED_PROVIDERS_DIR=$(json_value providers_dir || true)
 [ "$DISCOVERED_CONTAINER" = "$CONTAINER" ] || { echo "discovery container mismatch; refusing to continue" >&2; exit 1; }
 [ -n "$DISCOVERED_SERVICE" ] || { echo "discovery service name is missing; refusing to continue" >&2; exit 1; }
 [ -n "$DISCOVERED_API" ] && [ -n "$DISCOVERED_PROXY" ] || { echo "discovery did not return internal API and proxy URLs" >&2; exit 1; }
@@ -215,6 +216,28 @@ echo "discovered api=$DISCOVERED_API"
 echo "discovered proxy=$DISCOVERED_PROXY"
 echo "discovered groups channel=$DISCOVERED_CHANNEL main=$DISCOVERED_MAIN backup=$DISCOVERED_BACKUP"
 echo "discovered providers main=${DISCOVERED_MAIN_PROVIDER:-unknown} backup=${DISCOVERED_BACKUP_PROVIDER:-unknown}"
+
+PYTHONPATH="$REPO_DIR" python3 - "$CONFIG_PATH" "$DISCOVERED_PROVIDERS_DIR" "$DISCOVERED_BACKUP_PROVIDER" <<'PY'
+import sys
+from pathlib import Path
+
+from scripts.provider_filter_guard import validate_nonempty_provider_filters
+
+config_path = Path(sys.argv[1])
+providers_dir = sys.argv[2] or None
+provider_names = [item for item in sys.argv[3].split(",") if item]
+reports = validate_nonempty_provider_filters(
+    config_path.read_text(encoding="utf-8"),
+    config_path,
+    providers_dir,
+    provider_names,
+)
+for report in reports:
+    print(
+        f"backup provider filter preflight: provider={report.provider} "
+        f"cache_count={report.cache_count} match_count={report.match_count}"
+    )
+PY
 
 (cd "$PROJECT_DIR" && docker compose -f "$COMPOSE_PATH" config >/dev/null) || { echo "compose config validation failed" >&2; exit 1; }
 PATCHED_COMPOSE=$(python3 - "$COMPOSE_PATH" "$GUARDIAN_ROOT" "$PROJECT_DIR" <<'PY'

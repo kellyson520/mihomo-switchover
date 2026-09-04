@@ -110,6 +110,8 @@ decision:
   mode: observe
   interval: 15s
   probe_interval: 5m
+  failure_recheck_interval: 30s
+  recovery_healthcheck_interval: 2m
   failures_before_switch: 3
   recoveries_before_switch: 2
   min_hold: 120s
@@ -197,6 +199,10 @@ guardian 同时订阅 mihomo controller 的 `/logs?level=error` 日志流。日�
 mihomo provider 健康证据确认；provider 拉取、过滤器和配置错误不会直接触发切换。日志
 流断开时自动退避重连，失败不影响 mihomo 或 guardian 主循环。
 
+安装器会在任何备份、构建或容器操作之前读取已缓存的 provider 节点名称，验证带
+`filter` 的 provider 至少保留一个节点。零匹配、缓存缺失或正则非法都会中止安装并保留
+原配置；过滤器不会被自动改写。
+
 当 provider 已配置但候选暂时未验证时，guardian 还会调用 mihomo 的：
 
 ```text
@@ -204,7 +210,7 @@ GET /providers/proxies/<provider>/healthcheck
 ```
 
 请求 mihomo 立即刷新原生健康证据。该检查异步执行，不选择节点、不写入 `CHANNEL`，
-并按 `decision.probe_interval` 限频（生产默认 5 分钟），避免备用运行期间主渠道长期
+并按 `decision.recovery_healthcheck_interval` 限频（生产默认 2 分钟），避免备用运行期间主渠道长期
 停留在旧的 `alive: false`，也避免对厂商健康地址产生高频请求。请求失败仍保持
 fail-closed，并写入 `provider_healthcheck_failed`；成功发起后写入
 `provider_healthcheck_requested`，等待后续周期读取新的 `alive` 和 `history`。
@@ -287,7 +293,8 @@ IP 身份一致和最低置信度。阈值、保留期和 target 顺序可热重
 | `critical_quorum` | `2` | 至少多少个启用的 critical 探测成功才算渠道健康，不能大于 critical 探测数。 |
 
 主循环每 15 秒运行，但公网厂商探测默认每 5 分钟才刷新一次；未验证 provider 的原生
-healthcheck 也按该周期限频。缓存期间不会把同一次失败重复计入连续失败次数。只有 3
+healthcheck 按独立的 `recovery_healthcheck_interval` 限频。收到 mihomo 网络错误日志后，
+guardian 会立即打破当前公网探测缓存；日志本身不直接触发切换。缓存期间不会把同一次失败重复计入连续失败次数。只有 3
 次新的关键探测失败、恢复阈值、最短保持时间和候选节点健康条件同时满足时才切换。纯净
 度评分不参与这个决策。
 
@@ -380,6 +387,8 @@ docker exec mihomo-cliproxy /guardian/bin/guardian quality run \
 - `decision.mode`
 - `decision.interval`
 - `decision.probe_interval`
+- `decision.failure_recheck_interval`
+- `decision.recovery_healthcheck_interval`
 - `decision.failures_before_switch`
 - `decision.recoveries_before_switch`
 - `decision.min_hold`

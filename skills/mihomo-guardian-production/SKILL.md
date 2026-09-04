@@ -80,10 +80,15 @@ OpenAI、Gemini 等公网厂商以及纯净度查询的最短刷新间隔，默�
 缓存期间不重复访问公网，切换到新节点会立即生成一次新样本。连续失败计数只对新样本
 递增，因此不会把缓存中的同一次失败误判为多次故障。
 
+日志 watcher 订阅 mihomo 本地 `/logs?level=error` WebSocket；拨号、TCP、TLS、超时、
+重置等网络错误只打破当前探测缓存，随后按 `failure_recheck_interval`（默认 `30s`）
+做有限次数的关键厂商复核。正常探测、mihomo 日志提示和月度质量巡检是三类独立证据，
+任何一类都不能单独切换渠道。
+
 生产建议保持 `probe_interval: 5m` 或更长，并通过 mihomo provider 的 `alive` 和
 history 判断节点候选；不要把 `decision.interval` 改成 5 分钟来代替它，否则会同时拖慢
 主备决策循环。provider 候选未验证时，guardian 会通过 mihomo loopback API 请求该
-provider 的原生 `/healthcheck`，按同一 `probe_interval` 限频；这是异步健康检查，不
+provider 的原生 `/healthcheck`，按独立的 `recovery_healthcheck_interval` 限频；这是异步健康检查，不
 选择 `CHANNEL`，不会让备用流量短暂经过主渠道。请求失败继续 fail-closed。日志会出现
 `provider_healthcheck_requested` 或 `provider_healthcheck_failed`。修改后按上面的
 `reload` 流程校验，先在 `observe` 模式观察日志。
@@ -170,9 +175,12 @@ health，guardian 每小时汇总已有延迟 history。首次完整有效报告
 `stability-history.jsonl` 和 latest 推荐输入；未建身份的节点等待下一次全量扫描，不会
 生成无 IP 记录。`quality status` 的 `latest_stability_at` 用来区分小时汇总时间和全量
 质量报告时间。汇总失败会记入 `quality_stability_summary_failed` 并按更短周期重试；
-失去 mihomo 心跳只重启质量子进程，不停止 mihomo 或实时 guardian。
+失去 mihomo 心跳只重启质量子进程，不停止 mihomo 或实时 guardian。三重保险的顺序是：
+正常状态低频公网探测、mihomo 网络错误日志触发的快速复核、以及按月的全量质量巡检；
+其中日志提示和质量评分都不能绕过关键厂商 quorum、provider `alive/history` 和粘性节点保护。
 
-可热重载：`decision.mode`、决策阈值/周期/保持时间、`decision.probe_interval`、`probes`、`purity`、
+可热重载：`decision.mode`、决策阈值/周期/保持时间、`decision.probe_interval`、
+`decision.failure_recheck_interval`、`decision.recovery_healthcheck_interval`、`probes`、`purity`、
 `quality`（目标顺序、阈值、周期、保留期）、`reload.check_interval`。需要重启 guardian：`mihomo` 连接端点、secret 路径、组、
 provider、日志配置、`link_loss_grace`、`startup_api_timeout`。静态字段变更后不能
 假定已生效；只重启 guardian 子进程，禁止重启 mihomo。
