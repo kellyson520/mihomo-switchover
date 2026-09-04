@@ -152,6 +152,7 @@ PY
 [ -f "$GUARDIAN_ROOT/guardian.yaml" ] || { echo "guardian.yaml is missing" >&2; exit 1; }
 [ -f "$GUARDIAN_ROOT/controller_secret" ] || { echo "controller_secret is missing" >&2; exit 1; }
 [ -f "$GUARDIAN_ROOT/start-guardian.sh" ] || { echo "start-guardian.sh is missing" >&2; exit 1; }
+[ -d "$GUARDIAN_ROOT/logs" ] || { echo "guardian logs directory is missing" >&2; exit 1; }
 
 processes() {
     docker top "$CONTAINER" -eo pid,ppid,comm,args 2>/dev/null
