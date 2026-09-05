@@ -20,7 +20,8 @@ backup_dir=
 rollback_or_abort() {
     ROLLBACK_IN_PROGRESS=1
     if ! GUARDIAN_LOCK_HELD=1 "$REPO_DIR/scripts/rollback.sh" \
-        --guardian-root "$GUARDIAN_ROOT" --container "$CONTAINER" --backup-dir "$backup_dir"; then
+        --guardian-root "$GUARDIAN_ROOT" --container "$CONTAINER" --backup-dir "$backup_dir" \
+        --lock-held; then
         echo "CRITICAL: automatic rollback failed; inspect $GUARDIAN_ROOT/backups and keep mihomo under manual observation" >&2
         return 2
     fi
@@ -486,7 +487,11 @@ SECRET_SOURCE=${MIHOMO_SECRET_FILE:-}
 if [ -z "$SECRET_SOURCE" ]; then SECRET_SOURCE=$(json_value host_secret_file || true); fi
 if [ -z "$SECRET_SOURCE" ] && [ -f "$PROJECT_DIR/.controller_secret" ]; then SECRET_SOURCE=$PROJECT_DIR/.controller_secret; fi
 if [ -n "$SECRET_SOURCE" ] && [ -f "$SECRET_SOURCE" ]; then
-    install -m 0640 "$SECRET_SOURCE" "$GUARDIAN_ROOT/controller_secret"
+    if [ "$SECRET_SOURCE" -ef "$GUARDIAN_ROOT/controller_secret" ]; then
+        : # The discovered controller secret is already the managed target.
+    else
+        install -m 0640 "$SECRET_SOURCE" "$GUARDIAN_ROOT/controller_secret"
+    fi
 else
     python3 - "$CONFIG_PATH" "$GUARDIAN_ROOT/controller_secret" <<'PY'
 import re

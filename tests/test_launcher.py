@@ -100,6 +100,20 @@ def test_install_does_not_swallow_rollback_failure_or_write_repo_temp_files():
     assert ".guardian.discovery.json" not in script
 
 
+def test_install_passes_lock_ownership_to_automatic_rollback():
+    script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    rollback = script.split("rollback_or_abort() {", 1)[1].split("\n}", 1)[0]
+    assert "--lock-held" in rollback
+
+
+def test_install_does_not_copy_controller_secret_onto_itself():
+    script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
+    secret_install = script.split("SECRET_SOURCE=${MIHOMO_SECRET_FILE:-}", 1)[1].split(
+        "\nfi\n\nPYTHONPATH=", 1
+    )[0]
+    assert 'SECRET_SOURCE" -ef "$GUARDIAN_ROOT/controller_secret"' in secret_install
+
+
 def test_install_gates_legacy_single_file_mount_migration():
     script = (Path(__file__).parents[1] / "scripts" / "install.sh").read_text()
     assert "MIGRATE_BIN_MOUNT=0" in script
